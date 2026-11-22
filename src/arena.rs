@@ -183,17 +183,35 @@ impl<T: Copy> WcParts<T> {
         self.full[p].len() * Self::PER + if c.0.is_null() { 0 } else { c.1 as usize }
     }
 
+    /// Index the next record pushed to partition `p` will get.
     #[inline(always)]
-    pub fn for_each(&self, p: usize, mut f: impl FnMut(&T)) {
+    pub fn next_index(&self, p: usize) -> usize {
+        let c = unsafe { self.cur.get_unchecked(p) };
+        self.full[p].len() * Self::PER + if c.0.is_null() { 0 } else { c.1 as usize } + unsafe { *self.fill.get_unchecked(p) } as usize
+    }
+
+    /// Address of record `k` of partition `p` (after `finish`).
+    #[inline(always)]
+    pub fn ptr_at(&self, p: usize, k: usize) -> *mut T {
+        let (b, i) = (k / Self::PER, k % Self::PER);
+        let base = if b < self.full[p].len() { self.full[p][b] as *mut T } else { self.cur[p].0 };
+        unsafe { base.add(i) }
+    }
+
+    #[inline(always)]
+    pub fn for_each(&self, p: usize, mut f: impl FnMut(usize, &T)) {
+        let mut k = 0;
         for &b in &self.full[p] {
             for v in unsafe { std::slice::from_raw_parts(b, Self::PER) } {
-                f(v);
+                f(k, v);
+                k += 1;
             }
         }
         let c = self.cur[p];
         if !c.0.is_null() {
             for v in unsafe { std::slice::from_raw_parts(c.0 as *const T, c.1 as usize) } {
-                f(v);
+                f(k, v);
+                k += 1;
             }
         }
     }

@@ -11,6 +11,8 @@ use memchr::memchr;
 
 mod arena;
 mod parquet_out;
+#[cfg(feature = "prof")]
+mod prof;
 mod scan;
 
 use arena::{Arena, WcParts};
@@ -143,18 +145,18 @@ pub fn unpack(r: u64) -> B {
 struct InFile {
     fd: i32,
     len: usize,
+    data: B, // mapped; /data is tmpfs on the scorer, so this is copy-free
 }
 
 fn open_dir(dir: &Path) -> Vec<InFile> {
     list_csv(dir)
         .iter()
         .map(|p| {
+            let data = map_file(p);
             let f = File::open(p).unwrap_or_else(|e| panic!("open {:?}: {}", p, e));
-            let len = f.metadata().unwrap().len() as usize;
             let fd = f.as_raw_fd();
             std::mem::forget(f);
-            unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_WILLNEED) };
-            InFile { fd, len }
+            InFile { fd, len: data.len(), data }
         })
         .collect()
 }
@@ -187,42 +189,23 @@ fn pread_full(fd: i32, buf: &mut [u8], off: usize) {
     }
 }
 
-/// Reads the lines that start in [start, end) (the header line excluded) into
-/// `buf` and returns them with the file offset of their first byte.
-fn read_lines<'b>(f: &InFile, start: usize, end: usize, buf: &'b mut Vec<u8>) -> (&'b [u8], usize) {
-    let rs = start.saturating_sub(1);
-    let mut extra = 64 << 10;
-    loop {
-        let want = (end + extra).min(f.len);
-        let n = want - rs;
-        buf.clear();
-        buf.reserve(n);
-        unsafe { buf.set_len(n) };
-        pread_full(f.fd, buf, rs);
-        // first line start: after the first newline at or after max(start, 1) - 1
-        let a = start.max(1) - 1 - rs;
-        let first = match memchr(b'\n', &buf[a..]) {
-            Some(i) => rs + a + i + 1,
-            None if want == f.len => return (&buf[0..0], 0),
-            None => {
-                extra *= 4;
-                continue;
-            }
-        };
-        if first >= end {
-            return (&buf[0..0], 0);
-        }
-        let b = end - 1 - rs;
-        let stop = match memchr(b'\n', &buf[b..]) {
-            Some(i) => rs + b + i + 1,
-            None if want == f.len => f.len,
-            None => {
-                extra *= 4;
-                continue;
-            }
-        };
-        return (&buf[first - rs..stop - rs], first);
+/// The lines that start in [start, end) (the header line excluded), with the
+/// file offset of their first byte.
+fn chunk_lines(f: &InFile, start: usize, end: usize) -> (B, usize) {
+    let d = f.data;
+    let a = start.max(1) - 1;
+    let first = match memchr(b'\n', &d[a..]) {
+        Some(i) => a + i + 1,
+        None => return (&d[0..0], 0),
+    };
+    if first >= end {
+        return (&d[0..0], 0);
     }
+    let stop = match memchr(b'\n', &d[end - 1..]) {
+        Some(i) => end + i,
+        None => d.len(),
+    };
+    (&d[first..stop], first)
 }
 
 // ---------- chunking ----------
@@ -352,6 +335,140 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     Some(v)
 }
 
+/// Per-thread cache of validated `YYYY-MM-DD` -> days since epoch: a window
+/// only ever sees a few dozen dates, so the calendar work is done once each.
+struct DateCache {
+    k: [u64; 256],
+    v: [i64; 256],
+}
+
+const BAD_DATE: i64 = i64::MIN;
+
+impl DateCache {
+    fn new() -> Self {
+        DateCache { k: [0; 256], v: [0; 256] }
+    }
+
+    /// Days of the date in s[0..10] (s.len() >= 19), None if not a valid date.
+    #[inline(always)]
+    fn days(&mut self, s: &[u8]) -> Option<i64> {
+        if s[4] != b'-' || s[7] != b'-' {
+            return None;
+        }
+        let key = u32::from_le_bytes(s[0..4].try_into().unwrap()) as u64
+            | (u16::from_le_bytes(s[5..7].try_into().unwrap()) as u64) << 32
+            | (u16::from_le_bytes(s[8..10].try_into().unwrap()) as u64) << 48;
+        let i = (key.wrapping_mul(0x9E3779B97F4A7C15) >> 56) as usize;
+        if self.k[i] == key && key != 0 {
+            let v = self.v[i];
+            return if v == BAD_DATE { None } else { Some(v) };
+        }
+        let v = Self::compute(s).unwrap_or(BAD_DATE);
+        self.k[i] = key;
+        self.v[i] = v;
+        if v == BAD_DATE {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    fn compute(s: &[u8]) -> Option<i64> {
+        let y = dig2(s, 0)? * 100 + dig2(s, 2)?;
+        let mo = dig2(s, 5)?;
+        let d = dig2(s, 8)?;
+        if !(1..=12).contains(&mo) || d < 1 {
+            return None;
+        }
+        let dim = match mo {
+            2 => {
+                if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                    29
+                } else {
+                    28
+                }
+            }
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if d > dim {
+            return None;
+        }
+        Some(days_from_civil(y, mo, d))
+    }
+}
+
+/// parse_local through the date cache: YYYY-MM-DDTHH:MM:SS
+#[inline(always)]
+fn parse_local_c(s: &[u8], dc: &mut DateCache) -> Option<i64> {
+    if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        return None;
+    }
+    let days = dc.days(s)?;
+    let h = dig2(s, 11)?;
+    let mi = dig2(s, 14)?;
+    let se = dig2(s, 17)?;
+    if h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    Some(((days * 24 + h) * 60 + mi) * 60_000 + se * 1000)
+}
+
+/// parse_ts with the date cache and an overflow-free path for short F3 values.
+#[inline(always)]
+fn parse_ts_c(s: &[u8], dc: &mut DateCache) -> Option<i64> {
+    let n = s.len();
+    if n == 20 && s[19] == b'Z' {
+        return parse_local_c(s, dc);
+    }
+    if n == 25 && s[22] == b':' {
+        if s[19] != b'+' && s[19] != b'-' {
+            return None;
+        }
+        let l = parse_local_c(s, dc)?;
+        let hh = dig2(s, 20)?;
+        let mm = dig2(s, 23)?;
+        if hh > 23 || mm > 59 {
+            return None;
+        }
+        let off = (hh * 60 + mm) * 60_000;
+        return Some(if s[19] == b'+' { l - off } else { l + off });
+    }
+    if n == 0 {
+        return None;
+    }
+    if n <= 18 {
+        let mut v: i64 = 0;
+        for &c in s {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + d as i64;
+        }
+        return Some(v);
+    }
+    parse_ts(s)
+}
+
+const W_VIEW: u32 = u32::from_le_bytes(*b"view");
+const W_CART: u32 = u32::from_le_bytes(*b"cart");
+const W_PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
+
+/// 0 view, 1 cart, 2 purchase, 3 anything else (exact, case-sensitive)
+#[inline(always)]
+fn type_code(t: &[u8]) -> u32 {
+    match t.len() {
+        4 => match u32::from_le_bytes(t.try_into().unwrap()) {
+            W_VIEW => 0,
+            W_CART => 1,
+            _ => 3,
+        },
+        8 if u64::from_le_bytes(t.try_into().unwrap()) == W_PURCHASE => 2,
+        _ => 3,
+    }
+}
+
 #[inline(always)]
 fn parse_price(s: &[u8]) -> Option<u32> {
     if s.is_empty() {
@@ -379,7 +496,7 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 struct KeyRec {
     h: u64,
     ingest: u32, // seconds since epoch (ingest_ts is F1, whole seconds)
-    rf: u32,     // (thread << 27) | seq for an ok copy, NONE otherwise
+    rf: u32,     // where the ok copy's PRec is (see rec_loc), NONE otherwise
 }
 
 /// An ok event copy, routed to its person partition.
@@ -388,7 +505,17 @@ struct KeyRec {
 struct PRec {
     pkey: u64,
     ts: u32, // ms since base = window_start - 7d
-    rf: u32, // purchase << 31 | thread << 27 | seq
+    pp: u32, // price << 8 | killed << 7 | cat << 1 | purchase
+}
+
+const KILLED: u32 = 1 << 7;
+const LOC_K_BITS: u32 = 18;
+
+/// thread << 28 | person partition << 18 | index within that thread's partition
+#[inline(always)]
+fn rec_loc(tid: usize, p: usize, k: usize) -> u32 {
+    assert!(k < (1 << LOC_K_BITS) - 1, "partition too large");
+    ((tid as u32) << 28) | ((p as u32) << LOC_K_BITS) | k as u32
 }
 
 #[derive(Clone, Copy)]
@@ -742,14 +869,14 @@ struct ParseOut {
     keys: WcParts<KeyRec>, // [P1]
     precs: WcParts<PRec>,  // [P2]
     crecs: WcParts<CRec>, // [P2]
-    nseq: u32,               // ok events so far (seq numbers)
-    snames: Vec<(u32, u64)>, // singleton persons' events: (seq, packed user id), seq ascending
-    buys: Vec<(u32, u32)>, // purchases only: (seq, price << 8 | cat << 1 | 1), seq ascending
+    snames: Vec<(u32, u64)>, // names the id table could not take: (rec_loc, packed user id), sorted
 }
 unsafe impl Send for ParseOut {}
 unsafe impl Sync for ParseOut {}
 
 fn main() {
+    #[cfg(feature = "prof")]
+    prof::start();
     let t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let outd = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
@@ -775,7 +902,7 @@ fn main() {
     cats.push(b"unknown");
     cats.sort();
     cats.dedup();
-    assert!(cats.len() < 127, "too many categories");
+    assert!(cats.len() < 64, "too many categories");
     let ncat = cats.len();
     let unknown_rank = cats.iter().position(|c| *c == b"unknown").unwrap() as u32;
     let mut prod: IdMap<u32> = IdMap::default();
@@ -820,29 +947,29 @@ fn main() {
             keys: WcParts::new(P1),
             precs: WcParts::new(P2),
             crecs: WcParts::new(P2),
-            nseq: 0,
-            snames: Vec::with_capacity(ev_bytes / 70 / nt / 2 + 1024),
-            buys: Vec::with_capacity(ev_bytes / 70 / nt / 16 + 1024),
+            snames: Vec::new(),
         };
-        let tbits = (tid as u32) << 27;
-        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + (1 << 20));
-        // route a resolved event; a singleton whose name the table could not take
-        // keeps a copy in snames
-        let resolve = |po: &mut ParseOut, uh: u64, uref: u64, mut r: PRec| {
+        // route a resolved ok event and its dedup key (which records where the event
+        // went); a singleton whose name the table could not take keeps a copy in snames
+        let resolve = |po: &mut ParseOut, uh: u64, uref: u64, mut r: PRec, kp: usize, mut key: KeyRec| {
             let uid = unpack(uref);
             let (pk, named) = links.pkey(uh, uid, &mut po.arena);
             r.pkey = pk;
+            let p = p2_of(pk);
+            key.rf = rec_loc(tid, p, po.precs.next_index(p));
             if !named {
-                let p = po.arena.alloc(uid.len());
-                unsafe { std::ptr::copy_nonoverlapping(uid.as_ptr(), p, uid.len()) };
-                po.snames.push((r.rf & ((1 << 27) - 1), p as u64 | ((uid.len() as u64) << 48)));
+                let c = po.arena.alloc(uid.len());
+                unsafe { std::ptr::copy_nonoverlapping(uid.as_ptr(), c, uid.len()) };
+                po.snames.push((key.rf, c as u64 | ((uid.len() as u64) << 48)));
             }
-            po.precs.push(&mut po.arena, p2_of(r.pkey), r);
+            po.precs.push(&mut po.arena, p, r);
+            po.keys.push(&mut po.arena, kp, key);
         };
-        // prefetch pipelines: (uid hash, record)
-        let mut ep: [(u64, u64, PRec); PIPE] = [(0, 0, PRec { pkey: 0, ts: 0, rf: 0 }); PIPE];
+        // prefetch pipelines: (uid hash, uid, record, key partition, key)
+        let mut ep: [(u64, u64, PRec, usize, KeyRec); PIPE] = [(0, 0, PRec { pkey: 0, ts: 0, pp: 0 }, 0, KeyRec { h: 0, ingest: 0, rf: 0 }); PIPE];
         let mut cp: [(u64, CRec); PIPE] = [(0, CRec { pkey: 0, pfx: 0, loc: 0, ts: 0, camp: 0 }); PIPE];
         let (mut en, mut cn) = (0usize, 0usize);
+        let mut dc = DateCache::new();
         loop {
             let i = cur.fetch_add(1, Relaxed);
             if i >= chunks.len() {
@@ -850,7 +977,7 @@ fn main() {
             }
             let c = chunks[i];
             let fl = if c.kind == 1 { &ev_files[c.file as usize] } else { &ck_files[c.file as usize] };
-            let (data, off0) = read_lines(fl, c.start, c.end, &mut buf);
+            let (data, off0) = chunk_lines(fl, c.start, c.end);
             if c.kind == 1 {
                 scan::<7, _>(data, 0, data.len(), &mut |f: &[&[u8]; 7]| {
                     let [eid, uid, ts, ing, typ, pid, price] = *f;
@@ -858,24 +985,20 @@ fn main() {
                         return;
                     }
                     let (h1, h2) = hash2(eid);
-                    let ing_ms = parse_ts(ing);
+                    let ing_ms = parse_ts_c(ing, &mut dc);
                     let ingest = match ing_ms {
                         Some(m) => (m.div_euclid(1000)).clamp(0, u32::MAX as i64 - 1) as u32,
                         None => u32::MAX,
                     };
-                    let tcode: u32 = match typ {
-                        b"view" => 0,
-                        b"cart" => 1,
-                        b"purchase" => 2,
-                        _ => 3,
-                    };
-                    let mut rf = NONE;
+                    let tcode = type_code(typ);
+                    let kp = (h2 >> (64 - P1_BITS)) as usize;
+                    let key = KeyRec { h: h1 | 1, ingest, rf: NONE };
                     'ok: {
                         if tcode == 3 || uid.is_empty() || pid.is_empty() {
                             break 'ok;
                         }
                         let Some(im) = ing_ms else { break 'ok };
-                        let Some(t) = parse_ts(ts) else { break 'ok };
+                        let Some(t) = parse_ts_c(ts, &mut dc) else { break 'ok };
                         if t < ws || t >= we || im - t > DAY_MS {
                             break 'ok;
                         }
@@ -885,37 +1008,26 @@ fn main() {
                             let cat = *prod.get(&hash1(pid)).unwrap_or(&unknown_rank);
                             pp = (p << 8) | (cat << 1) | 1;
                         }
-                        let seq = po.nseq;
-                        po.nseq += 1;
-                        rf = tbits | seq;
-                        if pp != 0 {
-                            po.buys.push((seq, pp));
-                        }
                         let uh = hash1(uid);
                         links.prefetch(uh);
                         let slot = en % PIPE;
                         if en >= PIPE {
-                            let (oh, ur, r) = ep[slot];
-                            resolve(&mut po, oh, ur, r);
+                            let (oh, ur, r, okp, okey) = ep[slot];
+                            resolve(&mut po, oh, ur, r, okp, okey);
                         }
-                        ep[slot] = (uh, pack(uid), PRec { pkey: 0, ts: (t - base) as u32, rf: rf | ((pp & 1) << 31) });
+                        ep[slot] = (uh, pack(uid), PRec { pkey: 0, ts: (t - base) as u32, pp }, kp, key);
                         en += 1;
+                        return;
                     }
-                    po.keys.push(&mut po.arena, (h2 >> (64 - P1_BITS)) as usize, KeyRec { h: h1 | 1, ingest, rf });
+                    po.keys.push(&mut po.arena, kp, key);
                 });
-                // pending uids point into buf: resolve them before it is reused
-                for k in en.saturating_sub(PIPE)..en {
-                    let (oh, ur, r) = ep[k % PIPE];
-                    resolve(&mut po, oh, ur, r);
-                }
-                en = 0;
             } else {
                 scan::<4, _>(data, 0, data.len(), &mut |f: &[&[u8]; 4]| {
                     let [id, uid, cid, ts] = *f;
                     if id.is_empty() || uid.is_empty() {
                         return;
                     }
-                    let Some(t) = parse_ts(ts) else { return };
+                    let Some(t) = parse_ts_c(ts, &mut dc) else { return };
                     if t < base || t >= we {
                         return;
                     }
@@ -934,6 +1046,11 @@ fn main() {
                 });
             }
         }
+        for k in en.saturating_sub(PIPE)..en {
+            let (oh, ur, r, okp, okey) = ep[k % PIPE];
+            resolve(&mut po, oh, ur, r, okp, okey);
+        }
+        po.snames.sort_unstable();
         for k in cn.saturating_sub(PIPE)..cn {
             let (oh, mut r) = cp[k % PIPE];
             r.pkey = links.pkey_only(oh);
@@ -946,16 +1063,17 @@ fn main() {
     });
     tick("parsed");
 
-    // ---- dedup: mark every non-winning ok copy in a kill bitmap ----
-    let kill: Vec<&[AtomicU64]> = parsed.iter().map(|p| zeroed_atomic64(p.nseq as usize / 64 + 1)).collect();
+    // ---- dedup: flag every non-winning ok copy in its PRec ----
     let cur = AtomicUsize::new(0);
     par(nt, |_| {
         let mut table: Vec<KeyRec> = Vec::new();
         let killit = |rf: u32| {
             if rf != NONE {
-                let t = (rf >> 27) as usize;
-                let s = (rf & ((1 << 27) - 1)) as usize;
-                kill[t][s >> 6].fetch_or(1u64 << (s & 63), Relaxed);
+                let t = (rf >> 28) as usize;
+                let p = ((rf >> LOC_K_BITS) & ((1 << P2_BITS) - 1)) as usize;
+                let k = (rf & ((1 << LOC_K_BITS) - 1)) as usize;
+                let r = parsed[t].precs.ptr_at(p, k);
+                unsafe { AtomicU32::from_ptr(std::ptr::addr_of_mut!((*r).pp)).fetch_or(KILLED, Relaxed) };
             }
         };
         loop {
@@ -969,7 +1087,7 @@ fn main() {
             table.clear();
             table.resize(cap, KeyRec { h: 0, ingest: 0, rf: 0 });
             for po in &parsed {
-                po.keys.for_each(p, |k| {
+                po.keys.for_each(p, |_, k| {
                     let mut i = k.h as usize & mask;
                     loop {
                         let e = &mut table[i];
@@ -1007,7 +1125,7 @@ fn main() {
             if i >= P2 {
                 break;
             }
-            st.run(&ctx, &links, &parsed, &kill, order[i], &mut wo);
+            st.run(&ctx, &links, &parsed, order[i], &mut wo);
         }
         wo
     });
@@ -1017,6 +1135,8 @@ fn main() {
     let camps = merge_campaign(&outs, &ctx);
     parquet_out::write_all(&outd, &users, &camps, &cats, &camp_names, nt);
     tick("written");
+    #[cfg(feature = "prof")]
+    prof::dump("/dev/shm/prof.txt");
     if verbose {
         if let Ok(sm) = fs::read_to_string("/proc/self/smaps_rollup") {
             for l in sm.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHuge") || l.starts_with("Anonymous")) {
@@ -1189,7 +1309,7 @@ impl PState {
         }
     }
 
-    fn run(&mut self, ctx: &Ctx, links: &Links, parsed: &[ParseOut], kill: &[&[AtomicU64]], p: usize, wo: &mut WorkerOut) {
+    fn run(&mut self, ctx: &Ctx, links: &Links, parsed: &[ParseOut], p: usize, wo: &mut WorkerOut) {
         let n: usize = parsed.iter().map(|po| po.precs.len(p)).sum();
         if n == 0 {
             return;
@@ -1201,19 +1321,12 @@ impl PState {
         self.epid.clear();
         self.evs.clear();
         // group surviving events by person
-        for po in parsed {
-            po.precs.for_each(p, |r| {
-                let t = ((r.rf >> 27) & 15) as usize;
-                let s = (r.rf & ((1 << 27) - 1)) as usize;
-                if kill[t][s >> 6].load(Relaxed) >> (s & 63) & 1 == 1 {
+        for (t, po) in parsed.iter().enumerate() {
+            po.precs.for_each(p, |k, r| {
+                if r.pp & KILLED != 0 {
                     return;
                 }
-                let pp = if r.rf >> 31 == 1 {
-                    let b = &parsed[t].buys;
-                    b[b.partition_point(|x| (x.0 as usize) < s)].1
-                } else {
-                    0
-                };
+                let pp = r.pp;
                 let (pid, new) = self.tab.get_or_insert(r.pkey, self.pkeys.len() as u32);
                 if new {
                     self.pkeys.push(r.pkey);
@@ -1221,7 +1334,8 @@ impl PState {
                         match links.single_name(r.pkey & !NAME_FLAG) {
                             0 => {
                                 let sn = &parsed[t].snames;
-                                sn[sn.partition_point(|x| (x.0 as usize) < s)].1
+                                let loc = rec_loc(t, p, k);
+                                sn[sn.partition_point(|x| x.0 < loc)].1
                             }
                             n => n,
                         }
@@ -1257,7 +1371,7 @@ impl PState {
         self.ccount.clear();
         self.ccount.resize(np, 0);
         for po in parsed {
-            po.crecs.for_each(p, |c| {
+            po.crecs.for_each(p, |_, c| {
                 if let Some(pid) = self.tab.get(c.pkey) {
                     self.ccount[pid as usize] += 1;
                     self.cks.push((pid, Ck { ts: c.ts, camp: c.camp, pfx: c.pfx, loc: c.loc }));
@@ -1417,7 +1531,7 @@ fn person(ctx: &Ctx, name: u64, evs: &[Ev], cks: &[Ck], wo: &mut WorkerOut, cnt:
             s_rev += price;
             s_purch = true;
             a_rev += price;
-            a_cat[((e.pp >> 1) & 127) as usize] += price;
+            a_cat[((e.pp >> 1) & 63) as usize] += price;
         }
         prev_ts = e.ts;
     }
