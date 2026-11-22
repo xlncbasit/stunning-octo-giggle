@@ -437,18 +437,32 @@ fn parse_ts_c(s: &[u8], dc: &mut DateCache) -> Option<i64> {
     if n == 0 {
         return None;
     }
-    if n <= 18 {
-        let mut v: i64 = 0;
-        for &c in s {
-            let d = c.wrapping_sub(b'0');
-            if d > 9 {
-                return None;
-            }
-            v = v * 10 + d as i64;
-        }
-        return Some(v);
+    if n <= 8 {
+        return digits8(s).map(|v| v as i64);
+    }
+    if n <= 16 {
+        let hi = digits8(&s[..n - 8])?;
+        let lo = digits8(&s[n - 8..])?;
+        return Some((hi * 100_000_000 + lo) as i64);
     }
     parse_ts(s)
+}
+
+/// Value of 1..=8 ASCII digits (SWAR), None if any byte is not 0-9.
+#[inline(always)]
+fn digits8(s: &[u8]) -> Option<u64> {
+    let mut b = [b'0'; 8];
+    b[8 - s.len()..].copy_from_slice(s);
+    let c = u64::from_le_bytes(b);
+    const HI: u64 = 0xF0F0F0F0F0F0F0F0;
+    const ZEROS: u64 = 0x3030303030303030;
+    if c & HI != ZEROS || c.wrapping_add(0x0606060606060606) & HI != ZEROS {
+        return None;
+    }
+    let v = c - ZEROS;
+    let v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
+    let v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFF;
+    Some((v * 10000 + (v >> 32)) & 0xFFFFFFFF)
 }
 
 const W_VIEW: u32 = u32::from_le_bytes(*b"view");
@@ -467,6 +481,15 @@ fn type_code(t: &[u8]) -> u32 {
         8 if u64::from_le_bytes(t.try_into().unwrap()) == W_PURCHASE => 2,
         _ => 3,
     }
+}
+
+/// n for an id of the form c_<digits> without leading zeros (1..=7 digits)
+#[inline(always)]
+fn camp_num(id: &[u8]) -> Option<usize> {
+    if id.len() < 3 || id.len() > 9 || id[0] != b'c' || id[1] != b'_' || (id[2] == b'0' && id.len() > 3) {
+        return None;
+    }
+    digits8(&id[2..]).map(|v| v as usize)
 }
 
 #[inline(always)]
@@ -921,6 +944,28 @@ fn main() {
         }
     }
     let ncamp = camp_names.len();
+    // campaign ids written as c_<n> (no leading zeros) resolve by n, checked byte for byte
+    let mut camp_by_num: Vec<u32> = Vec::new();
+    for (i, (id, _)) in camp_names.iter().enumerate() {
+        if let Some(n) = camp_num(id) {
+            if n < 1 << 20 {
+                if camp_by_num.len() <= n {
+                    camp_by_num.resize(n + 1, u32::MAX);
+                }
+                camp_by_num[n] = i as u32;
+            }
+        }
+    }
+    let camp_lookup = |cid: &[u8]| -> Option<u32> {
+        if let Some(n) = camp_num(cid) {
+            if let Some(&i) = camp_by_num.get(n) {
+                if i != u32::MAX && camp_names[i as usize].0 == cid {
+                    return Some(i);
+                }
+            }
+        }
+        camp.get(&hash1(cid)).copied()
+    };
     let day0 = ws.div_euclid(DAY_MS);
     let ndays = (((we - 1).div_euclid(DAY_MS)) - day0 + 1) as usize;
     let ctx = Ctx { base, ncat, ncamp, ndays, day0 };
@@ -1031,7 +1076,7 @@ fn main() {
                     if t < base || t >= we {
                         return;
                     }
-                    let Some(&cpn) = camp.get(&hash1(cid)) else { return };
+                    let Some(cpn) = camp_lookup(cid) else { return };
                     let loc = (c.file as u64) << 56 | ((off0 + (id.as_ptr() as usize - data.as_ptr() as usize)) as u64) << 16 | id.len().min(0xFFFF) as u64;
                     let uh = hash1(uid);
                     links.prefetch(uh);
@@ -1539,5 +1584,66 @@ fn person(ctx: &Ctx, name: u64, evs: &[Ev], cks: &[Ck], wo: &mut WorkerOut, cnt:
     flush_day!();
     for i in lo..hi {
         cdel(cnt, pos, active, cks[i].camp);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// parse_ts_c (date cache + SWAR digits) must agree with parse_ts everywhere.
+    #[test]
+    fn fast_ts_matches_reference() {
+        let mut dc = DateCache::new();
+        let fixed: &[&[u8]] = &[
+            b"2026-10-03T23:58:10Z", b"2026-10-03T19:58:10-04:00", b"1791071890000", b"0001791071890000",
+            b"1791071890000.0", b"1.79e12", b"-5", b"86400000", b"123456789012345678901", b"",
+            b"2026-02-29T00:00:00Z", b"2028-02-29T00:00:00Z", b"2026-13-01T00:00:00Z", b"2026-10-03T24:00:00Z",
+            b"2026-10-03T23:59:60Z", b"2026-10-03 23:58:10Z", b"2026-10-03t23:58:10Z", b"2026-10-03T23:58:10z",
+            b"2026-10-03T23:58:10+24:00", b"2026-10-03T23:58:10+05:60", b"2026-10-03T23:58:10+0200",
+            b"2026-10-03T23:58:10-00:00", b"2026-10-03T23:58:10+23:59", b"0", b"9", b"12345678", b"123456789",
+            b"9999999999999999", b"99999999999999999", b"999999999999999999", b"9223372036854775807",
+            b"9223372036854775808", b"\xd9\xa2\xd9\xa5", b"1\r", b"2026-10-03T23:58:10Z\r", b"/0", b":0",
+        ];
+        for s in fixed {
+            assert_eq!(parse_ts_c(s, &mut dc), parse_ts(s), "{:?}", String::from_utf8_lossy(s));
+        }
+        // random strings over a digit-heavy alphabet, all lengths 0..=26
+        let alphabet = b"0123456789-:TZ+/ .\xff";
+        let mut x = 0x2545F4914F6CDD1Du64;
+        for _ in 0..2_000_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = (x % 27) as usize;
+            let mut v = Vec::with_capacity(n);
+            let mut y = x;
+            for i in 0..n {
+                y = y.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407 + i as u64);
+                let pick = (y >> 33) as usize;
+                // mostly digits so long all-digit strings are common
+                v.push(if pick % 4 != 0 { b'0' + (pick % 10) as u8 } else { alphabet[pick % alphabet.len()] });
+            }
+            assert_eq!(parse_ts_c(&v, &mut dc), parse_ts(&v), "{:?}", v);
+        }
+    }
+
+    #[test]
+    fn digits8_and_camp_num() {
+        for k in 1..=8usize {
+            for v in [0u64, 1, 7, 42, 99_999_999, 12_345_678, 10_000_000] {
+                let s = format!("{:0width$}", v % 10u64.pow(k as u32), width = k);
+                assert_eq!(digits8(s.as_bytes()), Some(v % 10u64.pow(k as u32)), "{}", s);
+            }
+        }
+        assert_eq!(digits8(b"12a4"), None);
+        assert_eq!(digits8(b"1/34"), None);
+        assert_eq!(digits8(b"1:34"), None);
+        assert_eq!(camp_num(b"c_123"), Some(123));
+        assert_eq!(camp_num(b"c_0"), Some(0));
+        assert_eq!(camp_num(b"c_01"), None);
+        assert_eq!(camp_num(b"C_1"), None);
+        assert_eq!(camp_num(b"c_"), None);
+        assert_eq!(camp_num(b"c_1 "), None);
     }
 }

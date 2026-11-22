@@ -17,3 +17,10 @@ debug = false
 [dependencies]
 libc = "0.2.191"
 memchr = "2.8.3"
+
+[features]
+prof = []
+
+[profile.prof]
+inherits = "release"
+debug = "line-tables-only"
