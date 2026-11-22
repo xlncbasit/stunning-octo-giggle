@@ -174,19 +174,59 @@ fn calib() -> f64 {
     t.elapsed().as_secs_f64()
 }
 
-pub fn run(data: &Path, nt: usize) {
+/// Runs this binary on `data` in a child process; returns (wall s, phase line).
+fn child_phases(data: &Path) -> (f64, String) {
+    let base = std::env::var("SCRATCH_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+    let out = base.join(format!("diag_out_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&out);
+    let t = Instant::now();
+    let o = std::process::Command::new("/proc/self/exe")
+        .env("SS_NODIAG", "1")
+        .env("SS_VERBOSE", "1")
+        .env("DATA_DIR", data)
+        .env("OUTPUT_DIR", &out)
+        .output();
+    let s = t.elapsed().as_secs_f64();
+    let _ = fs::remove_dir_all(&out);
+    let ph = match o {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stderr)
+            .lines()
+            .filter(|l| l.starts_with('['))
+            .map(|l| {
+                let v: Vec<&str> = l.trim_start_matches('[').split(']').collect();
+                format!("{}={}", v.get(1).unwrap_or(&"").trim(), v[0].trim().trim_end_matches('s'))
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Ok(o) => format!("FAILED {:?}", o.status),
+        Err(e) => format!("ERR {}", e),
+    };
+    (s, ph)
+}
+
+pub fn run(data: &Path, _nt: usize) {
     let t0 = Instant::now();
-    let paths = files(data);
-    eprintln!("D1 cpu={} | quota={} | cpus={}", fs::read_to_string("/proc/cpuinfo").ok().and_then(|s| s.lines().find(|l| l.starts_with("model name")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())).unwrap_or_default(), fs::read_to_string("/sys/fs/cgroup/cpu.max").unwrap_or_default().trim(), fs::read_to_string("/sys/fs/cgroup/cpuset.cpus.effective").unwrap_or_default().trim());
-    residency(&paths);
-    read_all(&paths, 1, "pass1");
-    read_all(&paths, nt, "pass2");
-    let (mt, mu) = mmap_touch_unmap(&paths);
-    eprintln!("D2 mmap+touch {:.4}s munmap {:.4}s", mt, mu);
-    anon_touch(512, nt);
-    anon_touch(512, 1);
-    eprintln!("D3 calib 200M mul-rot loop: {:.3}s", calib());
-    let runs: Vec<String> = (0..4).map(|_| format!("{:.3}", child_run(data))).collect();
-    eprintln!("D4 full child runs on dev (wall s): {}", runs.join(" "));
-    eprintln!("D5 diag total {:.2}s", t0.elapsed().as_secs_f64());
+    let (w, ph) = child_phases(data);
+    eprintln!("V dev: wall {:.3}s | {}", w, ph);
+    let genp = std::env::var("SS_GEN").unwrap_or_else(|_| "/app/generate".into());
+    let gen = Path::new(&genp);
+    let scratch = std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into());
+    let g20 = Path::new(&scratch).join("g20");
+    if gen.exists() {
+        let t = Instant::now();
+        let st = std::process::Command::new(gen)
+            .args(["--seed", "2", "--events", "20000000", "--clicks", "5000000", "--output"])
+            .arg(&g20)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        eprintln!("V gen20 {:?} in {:.1}s", st.map(|s| s.success()), t.elapsed().as_secs_f64());
+        for i in 0..3 {
+            let (w, ph) = child_phases(&g20);
+            eprintln!("V r{} 20M: wall {:.3}s | {}", i, w, ph);
+        }
+    } else {
+        eprintln!("V no generator in image");
+    }
+    eprintln!("V diag total {:.1}s", t0.elapsed().as_secs_f64());
 }
