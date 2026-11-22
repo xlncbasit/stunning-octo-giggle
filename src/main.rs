@@ -763,7 +763,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .clamp(1, 16);
-    let diag_dev = fs::read_to_string(data_dir_for_diag()).map_or(false, |m| m.contains("2027-12-09T00:00:00Z"));
+    let diag_dev = std::env::var_os("SS_NODIAG").is_none() && fs::read_to_string(data_dir_for_diag()).map_or(false, |m| m.contains("2027-12-09T00:00:00Z"));
     let verbose = std::env::var("SS_VERBOSE").is_ok() || diag_dev;
     let tick = |what: &str| {
         if verbose {
@@ -773,7 +773,7 @@ fn main() {
 
     let (ws, we) = parse_manifest(&data.join("manifest.json"));
     // diagnostic build: on the public dev set, report the environment and fail on purpose
-    let diag = ws == parse_ts(b"2027-12-09T00:00:00Z").unwrap();
+    let diag = diag_dev;
     if diag {
         diag::run(&data, nt);
     }

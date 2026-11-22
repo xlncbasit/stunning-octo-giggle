@@ -55,7 +55,7 @@ fn residency(paths: &[std::path::PathBuf]) {
             libc::munmap(m, len);
         }
     }
-    eprintln!("  page cache residency before reading: {} of {} pages ({:.1}%)", res, tot, 100.0 * res as f64 / tot.max(1) as f64);
+    eprintln!("D0 cached {}/{} pages", res, tot);
 }
 
 fn read_all(paths: &[std::path::PathBuf], nt: usize, label: &str) {
@@ -91,7 +91,7 @@ fn read_all(paths: &[std::path::PathBuf], nt: usize, label: &str) {
         hs.into_iter().map(|h| h.join().unwrap()).sum()
     });
     let s = t.elapsed().as_secs_f64();
-    eprintln!("  read {} with {} threads: {} MB in {:.3}s = {:.2} GB/s", label, nt, total >> 20, s, total as f64 / s / 1e9);
+    eprintln!("D0 read {} nt={} {}MB {:.4}s {:.2}GB/s", label, nt, total >> 20, s, total as f64 / s / 1e9);
 }
 
 fn anon_touch(mb: usize, nt: usize) {
@@ -111,42 +111,82 @@ fn anon_touch(mb: usize, nt: usize) {
         }
     });
     let s = t.elapsed().as_secs_f64();
-    eprintln!("  fresh anon memory: {} MB touched by {} threads in {:.3}s = {:.2} GB/s", mb, nt, s, mb as f64 / 1024.0 / s);
+    eprintln!("D0 anon {}MB nt={} {:.4}s {:.2}GB/s", mb, nt, s, mb as f64 / 1024.0 / s);
+}
+
+/// Wall time of a full run of this binary on `data` in a child process.
+fn child_run(data: &Path) -> f64 {
+    let base = std::env::var("SCRATCH_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+    let out = base.join(format!("diag_out_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&out);
+    let t = Instant::now();
+    let st = std::process::Command::new("/proc/self/exe")
+        .env("SS_NODIAG", "1")
+        .env("DATA_DIR", data)
+        .env("OUTPUT_DIR", &out)
+        .stderr(std::process::Stdio::null())
+        .status();
+    let s = t.elapsed().as_secs_f64();
+    let _ = fs::remove_dir_all(&out);
+    if st.map_or(true, |x| !x.success()) {
+        return -1.0;
+    }
+    s
+}
+
+fn mmap_touch_unmap(paths: &[std::path::PathBuf]) -> (f64, f64) {
+    let t = Instant::now();
+    let mut maps = Vec::new();
+    let mut acc = 0usize;
+    for p in paths {
+        let f = fs::File::open(p).unwrap();
+        let len = f.metadata().unwrap().len() as usize;
+        if len == 0 {
+            continue;
+        }
+        unsafe {
+            let m = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) as *const u8;
+            let mut k = 0;
+            while k < len {
+                acc += *m.add(k) as usize;
+                k += 4096;
+            }
+            maps.push((m, len));
+        }
+    }
+    let a = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    for (m, len) in maps {
+        unsafe { libc::munmap(m as *mut libc::c_void, len) };
+    }
+    std::hint::black_box(acc);
+    (a, t.elapsed().as_secs_f64())
+}
+
+fn calib() -> f64 {
+    // single-thread integer work, comparable across machines
+    let t = Instant::now();
+    let mut x = 0x9E3779B97F4A7C15u64;
+    for i in 0..200_000_000u64 {
+        x = (x ^ i).wrapping_mul(0xD6E8FEB86659FD93).rotate_left(17);
+    }
+    std::hint::black_box(x);
+    t.elapsed().as_secs_f64()
 }
 
 pub fn run(data: &Path, nt: usize) {
     let t0 = Instant::now();
-    eprintln!("=== DIAG (scorer environment) ===");
-    let up = fs::read_to_string("/proc/uptime").unwrap_or_default();
-    eprintln!("  /proc/uptime: {}", up.trim());
-    if let Ok(st) = fs::read_to_string("/proc/self/stat") {
-        let f: Vec<&str> = st.rsplit(')').next().unwrap_or("").split_whitespace().collect();
-        eprintln!("  process starttime (clock ticks since boot): {}", f.get(19).unwrap_or(&"?"));
-    }
-    grep("/proc/cpuinfo", &["model name", "cpu MHz", "cache size", "siblings", "cpu cores"]);
-    if let Ok(s) = fs::read_to_string("/proc/cpuinfo") {
-        let fl = s.lines().find(|l| l.starts_with("flags")).unwrap_or("");
-        let has = |x: &str| fl.split_whitespace().any(|w| w == x);
-        eprintln!("  flags: avx2={} avx512f={} avx512bw={} bmi2={}", has("avx2"), has("avx512f"), has("avx512bw"), has("bmi2"));
-    }
-    eprintln!("  available_parallelism: {:?}", std::thread::available_parallelism().map(|n| n.get()));
-    grep("/proc/meminfo", &["MemTotal", "MemFree", "MemAvailable", "Cached", "AnonHugePages"]);
-    for p in ["/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/cpuset.cpus.effective", "/sys/kernel/mm/transparent_hugepage/enabled", "/sys/kernel/mm/transparent_hugepage/defrag"] {
-        eprintln!("  {}: {}", p, fs::read_to_string(p).unwrap_or_else(|_| "?".into()).trim());
-    }
-    if let Ok(m) = fs::read_to_string("/proc/mounts") {
-        for l in m.lines().filter(|l| l.contains(" /data ") || l.contains(" /output ") || l.contains(" /scratch ") || l.contains(" / ")) {
-            eprintln!("  mount: {}", l);
-        }
-    }
-    eprintln!("  kernel: {}", fs::read_to_string("/proc/version").unwrap_or_default().trim());
     let paths = files(data);
+    eprintln!("D1 cpu={} | quota={} | cpus={}", fs::read_to_string("/proc/cpuinfo").ok().and_then(|s| s.lines().find(|l| l.starts_with("model name")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())).unwrap_or_default(), fs::read_to_string("/sys/fs/cgroup/cpu.max").unwrap_or_default().trim(), fs::read_to_string("/sys/fs/cgroup/cpuset.cpus.effective").unwrap_or_default().trim());
     residency(&paths);
-    read_all(&paths, 1, "first pass");
-    residency(&paths);
-    read_all(&paths, 1, "second pass");
-    read_all(&paths, nt, "third pass");
+    read_all(&paths, 1, "pass1");
+    read_all(&paths, nt, "pass2");
+    let (mt, mu) = mmap_touch_unmap(&paths);
+    eprintln!("D2 mmap+touch {:.4}s munmap {:.4}s", mt, mu);
     anon_touch(512, nt);
     anon_touch(512, 1);
-    eprintln!("  diag took {:.3}s", t0.elapsed().as_secs_f64());
+    eprintln!("D3 calib 200M mul-rot loop: {:.3}s", calib());
+    let runs: Vec<String> = (0..4).map(|_| format!("{:.3}", child_run(data))).collect();
+    eprintln!("D4 full child runs on dev (wall s): {}", runs.join(" "));
+    eprintln!("D5 diag total {:.2}s", t0.elapsed().as_secs_f64());
 }
