@@ -1,3 +1,5 @@
-target
-data
-out*
+/target
+/data
+/out/
+/out20/
+/out60/

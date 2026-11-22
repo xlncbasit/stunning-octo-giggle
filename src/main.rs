@@ -10,7 +10,7 @@ use std::time::Instant;
 use memchr::memchr;
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
-mod out;
+mod parquet_out;
 
 const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 604_800_000;
@@ -708,7 +708,7 @@ fn main() {
     });
     tick("sessions built");
 
-    out::write_all(&outd, &outs_users(&outs), &merge_campaign(&outs, &ctx, &camp_names, &cats), &cats, &camp_names, nt);
+    parquet_out::write_all(&outd, &outs_users(&outs), &merge_campaign(&outs, &ctx, &camp_names, &cats), &cats, &camp_names, nt);
     tick("written");
     // skip freeing GBs of buffers at exit
     unsafe { libc::_exit(0) }
