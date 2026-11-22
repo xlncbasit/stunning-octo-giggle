@@ -897,7 +897,22 @@ struct ParseOut {
 unsafe impl Send for ParseOut {}
 unsafe impl Sync for ParseOut {}
 
+/// The image carries an AVX-512 build next to this one; switch to it when the
+/// CPU supports it (the scorers are Cascade Lake or newer). Costs one exec.
+fn maybe_exec_v4() {
+    #[cfg(not(target_feature = "avx512bw"))]
+    {
+        use std::os::unix::process::CommandExt;
+        let v4 = std::env::var("SS_V4_PATH").unwrap_or_else(|_| "/app/shopping-v4".into());
+        if std::env::var_os("SS_NO_V4").is_none() && std::is_x86_feature_detected!("avx512bw") && Path::new(&v4).exists() {
+            let err = std::process::Command::new(&v4).env("SS_NO_V4", "1").exec();
+            eprintln!("exec {} failed: {}, continuing with the AVX2 build", v4, err);
+        }
+    }
+}
+
 fn main() {
+    maybe_exec_v4();
     #[cfg(feature = "prof")]
     prof::start();
     let t0 = Instant::now();

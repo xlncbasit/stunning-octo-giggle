@@ -7,7 +7,16 @@
 
 pub type B = &'static [u8];
 
-#[cfg(target_feature = "avx2")]
+#[cfg(target_feature = "avx512bw")]
+#[inline(always)]
+unsafe fn masks_ptr(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let v = _mm512_loadu_si512(p as *const __m512i);
+    let m = |c: u8| _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(c as i8));
+    (m(b'\n'), m(b','), m(b'"'))
+}
+
+#[cfg(all(target_feature = "avx2", not(target_feature = "avx512bw")))]
 #[inline(always)]
 unsafe fn masks_ptr(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
