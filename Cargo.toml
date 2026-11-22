@@ -1,0 +1,21 @@
+[package]
+name = "shopping"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "shopping"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[dependencies]
+libc = "0.2.191"
+memchr = "2.8.3"
+parquet = { version = "60.2.0", default-features = false }
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
