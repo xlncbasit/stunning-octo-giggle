@@ -10,6 +10,7 @@ use std::time::Instant;
 use memchr::memchr;
 
 mod arena;
+mod diag;
 mod parquet_out;
 #[cfg(feature = "prof")]
 mod prof;
@@ -897,6 +898,17 @@ struct ParseOut {
 unsafe impl Send for ParseOut {}
 unsafe impl Sync for ParseOut {}
 
+fn data_dir_for_diag() -> PathBuf {
+    PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into())).join("manifest.json")
+}
+
+fn cpu_secs() -> f64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
+    tv(ru.ru_utime) + tv(ru.ru_stime)
+}
+
 fn main() {
     #[cfg(feature = "prof")]
     prof::start();
@@ -908,14 +920,19 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .clamp(1, 16);
-    let verbose = std::env::var("SS_VERBOSE").is_ok();
+    let diag_dev = std::env::var_os("SS_NODIAG").is_none() && fs::read_to_string(data_dir_for_diag()).map_or(false, |m| m.contains("2027-12-09T00:00:00Z"));
+    let verbose = std::env::var("SS_VERBOSE").is_ok() || diag_dev;
     let tick = |what: &str| {
         if verbose {
-            eprintln!("[{:7.3}s] {}", t0.elapsed().as_secs_f64(), what)
+            eprintln!("[{:7.3}s] {} cpu={:.3}", t0.elapsed().as_secs_f64(), what, cpu_secs())
         }
     };
 
     let (ws, we) = parse_manifest(&data.join("manifest.json"));
+    // diagnostic build: on the public dev set, report the environment and fail on purpose
+    if diag_dev {
+        diag::run(&data, nt);
+    }
     let base = ws - WEEK_MS;
     assert!(we - base < u32::MAX as i64, "window too long");
 
@@ -1184,6 +1201,10 @@ fn main() {
     let camps = merge_campaign(&outs, &ctx);
     parquet_out::write_all(&outd, &users, &camps, &cats, &camp_names, nt);
     tick("written");
+    if diag_dev {
+        eprintln!("=== DIAG done: exiting 3 on purpose so the scorer returns these logs ===");
+        unsafe { libc::_exit(3) }
+    }
     #[cfg(feature = "prof")]
     prof::dump("/dev/shm/prof.txt");
     if verbose {

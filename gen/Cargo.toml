@@ -1,0 +1,15 @@
+[package]
+name = "shopping-sessions-generator"
+version = "0.1.0"
+description = "Writes a Shopping Sessions dataset: messy events and clicks, products, campaigns and a manifest, byte-identical for a seed."
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "generate"
+path = "src/main.rs"
+
+[profile.release]
+debug = false
+panic = "abort"
