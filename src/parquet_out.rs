@@ -2,6 +2,7 @@
 //! data page per column, thrift-compact footer. Just what the two tables need.
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use super::{unpack, CampRow, UserRow, B};
@@ -88,72 +89,107 @@ impl Thrift {
     }
 }
 
-struct Col {
+/// Buffered file output that tracks its position.
+struct Sink {
+    f: fs::File,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl Sink {
+    fn new(path: &Path) -> Self {
+        Sink { f: fs::File::create(path).unwrap(), buf: Vec::with_capacity(1 << 20), pos: 0 }
+    }
+    #[inline(always)]
+    fn put(&mut self, b: &[u8]) {
+        self.buf.extend_from_slice(b);
+        self.pos += b.len();
+        if self.buf.len() >= 1 << 20 {
+            self.flush();
+        }
+    }
+    fn flush(&mut self) {
+        self.f.write_all(&self.buf).unwrap();
+        self.buf.clear();
+    }
+}
+
+/// A column described by its encoded page size and an emitter that streams
+/// the page body (definition levels, if any, then PLAIN values).
+struct Col<'a> {
     name: &'static str,
     ty: i32,
     optional: bool,
     converted: Option<i32>,
-    values: Vec<u8>,          // PLAIN-encoded non-null values
-    defs: Option<Vec<bool>>,  // per row, for optional columns
+    size: usize,
+    emit: Box<dyn Fn(&mut Sink) + 'a>,
 }
 
-impl Col {
-    fn new(name: &'static str, ty: i32, optional: bool, converted: Option<i32>, cap: usize) -> Self {
-        Col { name, ty, optional, converted, values: Vec::with_capacity(cap), defs: if optional { Some(Vec::new()) } else { None } }
-    }
-    fn i32(&mut self, v: i32) {
-        self.values.extend_from_slice(&v.to_le_bytes());
-    }
-    fn i64(&mut self, v: i64) {
-        self.values.extend_from_slice(&v.to_le_bytes());
-    }
-    fn bytes(&mut self, s: &[u8]) {
-        self.values.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        self.values.extend_from_slice(s);
-    }
-    fn opt_bytes(&mut self, s: Option<&[u8]>) {
-        let d = self.defs.as_mut().unwrap();
-        d.push(s.is_some());
-        if let Some(s) = s {
-            self.bytes(s);
+fn bytes_col<'a>(name: &'static str, optional: bool, n: usize, get: impl Fn(usize) -> Option<&'a [u8]> + 'a) -> Col<'a> {
+    let mut size = 0;
+    for i in 0..n {
+        if let Some(v) = get(i) {
+            size += 4 + v.len();
         }
     }
-}
-
-/// RLE/bit-packed hybrid, bit width 1, as bit-packed groups of 8.
-fn encode_defs(defs: &[bool]) -> Vec<u8> {
-    let groups = (defs.len() + 7) / 8;
-    let mut b = Vec::with_capacity(groups + 10);
-    varint(&mut b, ((groups as u64) << 1) | 1);
-    for g in 0..groups {
-        let mut byte = 0u8;
-        for k in 0..8 {
-            if defs.get(g * 8 + k).copied().unwrap_or(false) {
-                byte |= 1 << k;
+    let groups = (n + 7) / 8;
+    let mut hdr = Vec::new();
+    varint(&mut hdr, ((groups as u64) << 1) | 1);
+    if optional {
+        size += 4 + hdr.len() + groups;
+    }
+    let emit = Box::new(move |w: &mut Sink| {
+        if optional {
+            w.put(&((hdr.len() + groups) as u32).to_le_bytes());
+            w.put(&hdr);
+            for g in 0..groups {
+                let mut byte = 0u8;
+                for k in 0..8 {
+                    let i = g * 8 + k;
+                    if i < n && get(i).is_some() {
+                        byte |= 1 << k;
+                    }
+                }
+                w.put(&[byte]);
             }
         }
-        b.push(byte);
-    }
-    b
+        for i in 0..n {
+            if let Some(v) = get(i) {
+                w.put(&(v.len() as u32).to_le_bytes());
+                w.put(v);
+            }
+        }
+    });
+    Col { name, ty: T_BYTE_ARRAY, optional, converted: Some(CT_UTF8), size, emit }
+}
+
+fn i32_col<'a>(name: &'static str, converted: Option<i32>, n: usize, get: impl Fn(usize) -> i32 + 'a) -> Col<'a> {
+    let emit = Box::new(move |w: &mut Sink| {
+        for i in 0..n {
+            w.put(&get(i).to_le_bytes());
+        }
+    });
+    Col { name, ty: T_INT32, optional: false, converted, size: 4 * n, emit }
+}
+
+fn i64_col<'a>(name: &'static str, n: usize, get: impl Fn(usize) -> i64 + 'a) -> Col<'a> {
+    let emit = Box::new(move |w: &mut Sink| {
+        for i in 0..n {
+            w.put(&get(i).to_le_bytes());
+        }
+    });
+    Col { name, ty: T_INT64, optional: false, converted: None, size: 8 * n, emit }
 }
 
 fn write_file(path: &Path, cols: Vec<Col>, nrows: usize) {
-    let total: usize = cols.iter().map(|c| c.values.len() + nrows / 8 + 64).sum();
-    let mut out: Vec<u8> = Vec::with_capacity(total + 4096);
-    out.extend_from_slice(b"PAR1");
+    let mut w = Sink::new(path);
+    w.put(b"PAR1");
     let mut metas: Vec<(i64, i64)> = Vec::new(); // (data_page_offset, total size)
     for c in &cols {
-        let mut page = Vec::new();
-        if let Some(d) = &c.defs {
-            let enc = encode_defs(d);
-            page.extend_from_slice(&(enc.len() as u32).to_le_bytes());
-            page.extend_from_slice(&enc);
-        }
-        let page_len = page.len() + c.values.len();
         let mut h = Thrift::new();
         h.i32(1, 0); // DATA_PAGE
-        h.i32(2, page_len as i32);
-        h.i32(3, page_len as i32);
+        h.i32(2, c.size as i32);
+        h.i32(3, c.size as i32);
         h.begin(5);
         h.i32(1, nrows as i32);
         h.i32(2, ENC_PLAIN);
@@ -161,11 +197,12 @@ fn write_file(path: &Path, cols: Vec<Col>, nrows: usize) {
         h.i32(4, ENC_RLE);
         h.end();
         h.b.push(0);
-        let off = out.len() as i64;
-        out.extend_from_slice(&h.b);
-        out.extend_from_slice(&page);
-        out.extend_from_slice(&c.values);
-        metas.push((off, out.len() as i64 - off));
+        let off = w.pos as i64;
+        w.put(&h.b);
+        let before = w.pos;
+        (c.emit)(&mut w);
+        assert_eq!(w.pos - before, c.size, "column {} size", c.name);
+        metas.push((off, w.pos as i64 - off));
     }
     // footer
     let mut f = Thrift::new();
@@ -219,52 +256,50 @@ fn write_file(path: &Path, cols: Vec<Col>, nrows: usize) {
     f.end();
     f.bin(6, b"shopping-sessions");
     f.b.push(0);
-    out.extend_from_slice(&f.b);
-    out.extend_from_slice(&(f.b.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    fs::write(path, &out).unwrap();
+    w.put(&f.b);
+    w.put(&(f.b.len() as u32).to_le_bytes());
+    w.put(b"PAR1");
+    w.flush();
 }
 
 fn write_users(path: &Path, rows: &[UserRow], cats: &[B]) {
     let n = rows.len();
-    let mut name = Col::new("user_id", T_BYTE_ARRAY, false, Some(CT_UTF8), n * 16);
-    let mut day = Col::new("day", T_INT32, false, Some(CT_DATE), n * 4);
-    let mut ses = Col::new("sessions", T_INT64, false, None, n * 8);
-    let mut evs = Col::new("events", T_INT64, false, None, n * 8);
-    let mut rev = Col::new("revenue_cents", T_INT64, false, None, n * 8);
-    let mut top = Col::new("top_category", T_BYTE_ARRAY, true, Some(CT_UTF8), n * 4);
-    top.defs.as_mut().unwrap().reserve(n);
-    for r in rows {
-        name.bytes(unpack(r.name));
-        day.i32(r.day);
-        ses.i64(r.sessions as i64);
-        evs.i64(r.events as i64);
-        rev.i64(r.revenue);
-        top.opt_bytes(if r.topcat == 255 { None } else { Some(cats[r.topcat as usize]) });
-    }
-    write_file(path, vec![name, day, ses, evs, rev, top], n);
+    let cols = vec![
+        bytes_col("user_id", false, n, move |i| Some(unpack(rows[i].name))),
+        i32_col("day", Some(CT_DATE), n, move |i| rows[i].day),
+        i64_col("sessions", n, move |i| rows[i].sessions as i64),
+        i64_col("events", n, move |i| rows[i].events as i64),
+        i64_col("revenue_cents", n, move |i| rows[i].revenue),
+        bytes_col("top_category", true, n, move |i| {
+            let t = rows[i].topcat;
+            if t == 255 {
+                None
+            } else {
+                Some(cats[t as usize])
+            }
+        }),
+    ];
+    write_file(path, cols, n);
 }
 
 fn write_camps(path: &Path, rows: &[CampRow], names: &[(B, B)]) {
     let n = rows.len();
-    let mut id = Col::new("campaign_id", T_BYTE_ARRAY, false, Some(CT_UTF8), n * 12);
-    let mut ch = Col::new("channel", T_BYTE_ARRAY, false, Some(CT_UTF8), n * 12);
-    let mut day = Col::new("day", T_INT32, false, Some(CT_DATE), n * 4);
-    let mut v: Vec<Col> = ["sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"]
-        .iter()
-        .map(|&nm| Col::new(nm, T_INT64, false, None, n * 8))
-        .collect();
-    for r in rows {
-        let (a, b): (&[u8], &[u8]) = if r.camp < names.len() { names[r.camp] } else { (b"organic", b"organic") };
-        id.bytes(a);
-        ch.bytes(b);
-        day.i32(r.day);
-        for k in 0..4 {
-            v[k].i64(r.v[k]);
+    let nm = move |c: usize| -> (&[u8], &[u8]) {
+        if c < names.len() {
+            names[c]
+        } else {
+            (b"organic", b"organic")
         }
-    }
-    let mut cols = vec![id, ch, day];
-    cols.extend(v);
+    };
+    let cols = vec![
+        bytes_col("campaign_id", false, n, move |i| Some(nm(rows[i].camp).0)),
+        bytes_col("channel", false, n, move |i| Some(nm(rows[i].camp).1)),
+        i32_col("day", Some(CT_DATE), n, move |i| rows[i].day),
+        i64_col("sessions", n, move |i| rows[i].v[0]),
+        i64_col("purchasing_sessions", n, move |i| rows[i].v[1]),
+        i64_col("revenue_cents", n, move |i| rows[i].v[2]),
+        i64_col("assisted_sessions", n, move |i| rows[i].v[3]),
+    ];
     write_file(path, cols, n);
 }
 

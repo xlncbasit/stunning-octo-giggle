@@ -472,7 +472,7 @@ fn build_links(files: &[B], nt: usize) -> Links {
     let mut chunks = Vec::new();
     make_chunks(files, 0, &mut chunks);
     let lines: usize = files.iter().map(|d| memchr::memchr_iter(b'\n', d).count() + 1).sum();
-    let cap = (lines * 3).next_power_of_two().max(1024); // unique ids <= 2 * lines
+    let cap = (2 * lines + 1).next_power_of_two().max(1024); // unique ids <= 2 * lines < cap
     let lk = Links {
         keys: zeroed_atomic64(cap),
         refs: zeroed_atomic64(cap),
@@ -591,7 +591,7 @@ struct ParseOut {
     precs: WcParts<PRec>,  // [P2]
     crecs: Parts<CRec>,  // [P2]
     urefs: Vec<u64>,     // seq -> packed user id
-    pps: Vec<u32>,       // seq -> price << 8 | cat << 1 | purchase
+    buys: Vec<(u32, u32)>, // purchases only: (seq, price << 8 | cat << 1 | 1), seq ascending
 }
 unsafe impl Send for ParseOut {}
 unsafe impl Sync for ParseOut {}
@@ -667,7 +667,7 @@ fn main() {
             precs: WcParts::new(P2),
             crecs: Parts::new(P2),
             urefs: Vec::with_capacity(ev_bytes / 70 / nt + 1024),
-            pps: Vec::with_capacity(ev_bytes / 70 / nt + 1024),
+            buys: Vec::with_capacity(ev_bytes / 70 / nt / 16 + 1024),
         };
         let tbits = (tid as u32) << 27;
         // prefetch pipelines: (uid hash, record)
@@ -717,7 +717,9 @@ fn main() {
                         let seq = po.urefs.len() as u32;
                         rf = tbits | seq;
                         po.urefs.push(pack(uid));
-                        po.pps.push(pp);
+                        if pp != 0 {
+                            po.buys.push((seq, pp));
+                        }
                         let uh = hash1(uid);
                         links.prefetch(uh);
                         let slot = en % PIPE;
@@ -1015,7 +1017,12 @@ impl PState {
                 if kill[t][s >> 6].load(Relaxed) >> (s & 63) & 1 == 1 {
                     return;
                 }
-                let pp = if r.rf >> 31 == 1 { parsed[t].pps[s] } else { 0 };
+                let pp = if r.rf >> 31 == 1 {
+                    let b = &parsed[t].buys;
+                    b[b.partition_point(|x| (x.0 as usize) < s)].1
+                } else {
+                    0
+                };
                 let (pid, new) = self.tab.get_or_insert(r.pkey, self.pkeys.len() as u32);
                 if new {
                     self.pkeys.push(r.pkey);
