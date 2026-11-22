@@ -20,7 +20,7 @@ use scan::{scan, B};
 const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 604_800_000;
 const DAY_MS: i64 = 86_400_000;
-const CHUNK: usize = 2 << 20;
+const CHUNK: usize = 512 << 10;
 const P1_BITS: u32 = 10; // eid partitions (dedup)
 const P2_BITS: u32 = 10; // person partitions (sessions)
 const P1: usize = 1 << P1_BITS;
@@ -77,7 +77,7 @@ fn hash2(s: &[u8]) -> (u64, u64) {
 }
 #[inline(always)]
 fn hash1(s: &[u8]) -> u64 {
-    let h = hash2(s).0;
+    let h = hash2(s).0 >> 1;
     if h == 0 {
         1
     } else {
@@ -131,12 +131,98 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[inline(always)]
-fn pack(s: B) -> u64 {
+fn pack(s: &[u8]) -> u64 {
     (s.as_ptr() as u64) | ((s.len() as u64) << 48)
 }
 #[inline(always)]
 pub fn unpack(r: u64) -> B {
     unsafe { std::slice::from_raw_parts((r & ((1u64 << 48) - 1)) as *const u8, (r >> 48) as usize) }
+}
+
+// ---------- input files read with pread ----------
+struct InFile {
+    fd: i32,
+    len: usize,
+}
+
+fn open_dir(dir: &Path) -> Vec<InFile> {
+    list_csv(dir)
+        .iter()
+        .map(|p| {
+            let f = File::open(p).unwrap_or_else(|e| panic!("open {:?}: {}", p, e));
+            let len = f.metadata().unwrap().len() as usize;
+            let fd = f.as_raw_fd();
+            std::mem::forget(f);
+            unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_WILLNEED) };
+            InFile { fd, len }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct RChunk {
+    file: u32,
+    kind: u8, // 1 events, 2 clicks
+    start: usize,
+    end: usize,
+}
+
+fn make_rchunks(files: &[InFile], kind: u8, out: &mut Vec<RChunk>) {
+    for (i, f) in files.iter().enumerate() {
+        let mut s = 0;
+        while s < f.len {
+            let e = (s + CHUNK).min(f.len);
+            out.push(RChunk { file: i as u32, kind, start: s, end: e });
+            s = e;
+        }
+    }
+}
+
+fn pread_full(fd: i32, buf: &mut [u8], off: usize) {
+    let mut done = 0;
+    while done < buf.len() {
+        let r = unsafe { libc::pread(fd, buf.as_mut_ptr().add(done) as *mut libc::c_void, buf.len() - done, (off + done) as libc::off_t) };
+        assert!(r > 0, "pread failed");
+        done += r as usize;
+    }
+}
+
+/// Reads the lines that start in [start, end) (the header line excluded) into
+/// `buf` and returns them with the file offset of their first byte.
+fn read_lines<'b>(f: &InFile, start: usize, end: usize, buf: &'b mut Vec<u8>) -> (&'b [u8], usize) {
+    let rs = start.saturating_sub(1);
+    let mut extra = 64 << 10;
+    loop {
+        let want = (end + extra).min(f.len);
+        let n = want - rs;
+        buf.clear();
+        buf.reserve(n);
+        unsafe { buf.set_len(n) };
+        pread_full(f.fd, buf, rs);
+        // first line start: after the first newline at or after max(start, 1) - 1
+        let a = start.max(1) - 1 - rs;
+        let first = match memchr(b'\n', &buf[a..]) {
+            Some(i) => rs + a + i + 1,
+            None if want == f.len => return (&buf[0..0], 0),
+            None => {
+                extra *= 4;
+                continue;
+            }
+        };
+        if first >= end {
+            return (&buf[0..0], 0);
+        }
+        let b = end - 1 - rs;
+        let stop = match memchr(b'\n', &buf[b..]) {
+            Some(i) => rs + b + i + 1,
+            None if want == f.len => f.len,
+            None => {
+                extra *= 4;
+                continue;
+            }
+        };
+        return (&buf[first - rs..stop - rs], first);
+    }
 }
 
 // ---------- chunking ----------
@@ -309,10 +395,10 @@ struct PRec {
 #[repr(C)]
 struct CRec {
     pkey: u64,
-    idref: u64,
+    pfx: u64, // first 8 bytes of click_id, big-endian
+    loc: u64, // file << 56 | offset << 16 | len: where to re-read the full id on a tie
     ts: u32,
     camp: u32,
-    _pad: u64,
 }
 
 #[inline(always)]
@@ -351,6 +437,16 @@ fn huge_zeroed<T>(n: usize) -> &'static [T] {
 }
 fn zeroed_atomic64(n: usize) -> &'static [AtomicU64] {
     huge_zeroed(n)
+}
+
+/// First 8 bytes, zero padded, big-endian: when two prefixes differ they order
+/// the ids byte-wise; equal prefixes need a full compare.
+#[inline(always)]
+fn prefix8(s: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = s.len().min(8);
+    b[..n].copy_from_slice(&s[..n]);
+    u64::from_be_bytes(b)
 }
 
 #[inline(always)]
@@ -393,9 +489,17 @@ struct Links {
     parent: &'static [AtomicU32], // union-find, set when a slot is claimed; after build: root
     names: &'static [AtomicU64],  // root -> packed smallest id
     mask: usize,
-    lut: &'static [AtomicU64], // compact lookup: [2i] = id hash, [2i+1] = root
+    // lookup table over all ids: [2i] = id hash, [2i+1] = root | 1<<62 for a
+    // linked id, or (for a singleton) its copied name | 1<<63, 0 while pending
+    lut: &'static [AtomicU64],
     lmask: usize,
+    singles: AtomicUsize,
+    single_limit: usize,
 }
+
+const NAME_FLAG: u64 = 1 << 63;
+const LINK_FLAG: u64 = 1 << 62;
+const NAME_MAX: usize = (1 << 14) - 1;
 
 impl Links {
     #[inline(always)]
@@ -452,24 +556,68 @@ impl Links {
     fn prefetch(&self, h: u64) {
         prefetch(&self.lut[2 * (h as usize & self.lmask)]);
     }
-    /// person key of an id hash: root | 1<<62 when linked, the hash | 1<<63 otherwise
+    /// person key of an id hash: root | 1<<62 when linked, the hash | 1<<63 otherwise.
+    /// The first sighting of a singleton copies its bytes into the table; returns
+    /// false when that could not be done (table full or id too long).
     #[inline(always)]
-    fn pkey(&self, h: u64) -> u64 {
+    fn pkey(&self, h: u64, id: &[u8], arena: &mut Arena) -> (u64, bool) {
         let mut i = h as usize & self.lmask;
         loop {
             let k = self.lut[2 * i].load(Relaxed);
             if k == h {
-                return self.lut[2 * i + 1].load(Relaxed) | (1 << 62);
+                let v = self.lut[2 * i + 1].load(Relaxed);
+                return if v & LINK_FLAG != 0 { (v, true) } else { (h | NAME_FLAG, true) };
             }
             if k == 0 {
-                return h | (1 << 63);
+                if id.len() > NAME_MAX || self.singles.load(Relaxed) >= self.single_limit {
+                    return (h | NAME_FLAG, false);
+                }
+                if self.lut[2 * i].compare_exchange(0, h, Relaxed, Relaxed).is_ok() {
+                    self.singles.fetch_add(1, Relaxed);
+                    let p = arena.alloc(id.len());
+                    unsafe { std::ptr::copy_nonoverlapping(id.as_ptr(), p, id.len()) };
+                    self.lut[2 * i + 1].store(p as u64 | ((id.len() as u64) << 48) | NAME_FLAG, Relaxed);
+                    return (h | NAME_FLAG, true);
+                }
+                continue;
+            }
+            i = (i + 1) & self.lmask;
+        }
+    }
+    /// person key without inserting (clicks never name a person)
+    #[inline(always)]
+    fn pkey_only(&self, h: u64) -> u64 {
+        let mut i = h as usize & self.lmask;
+        loop {
+            let k = self.lut[2 * i].load(Relaxed);
+            if k == h {
+                let v = self.lut[2 * i + 1].load(Relaxed);
+                return if v & LINK_FLAG != 0 { v } else { h | NAME_FLAG };
+            }
+            if k == 0 {
+                return h | NAME_FLAG;
+            }
+            i = (i + 1) & self.lmask;
+        }
+    }
+    /// packed name of a singleton id hash, 0 if it was not stored
+    fn single_name(&self, h: u64) -> u64 {
+        let mut i = h as usize & self.lmask;
+        loop {
+            let k = self.lut[2 * i].load(Relaxed);
+            if k == h {
+                let v = self.lut[2 * i + 1].load(Relaxed);
+                return if v & NAME_FLAG != 0 { v & !NAME_FLAG } else { 0 };
+            }
+            if k == 0 {
+                return 0;
             }
             i = (i + 1) & self.lmask;
         }
     }
 }
 
-fn build_links(files: &[B], nt: usize) -> Links {
+fn build_links(files: &[B], nt: usize, est_singles: usize) -> Links {
     let mut chunks = Vec::new();
     make_chunks(files, 0, &mut chunks);
     let lines: usize = files.iter().map(|d| memchr::memchr_iter(b'\n', d).count() + 1).sum();
@@ -482,6 +630,8 @@ fn build_links(files: &[B], nt: usize) -> Links {
         mask: cap - 1,
         lut: &[],
         lmask: 0,
+        singles: AtomicUsize::new(0),
+        single_limit: 0,
     };
     let cur = AtomicUsize::new(0);
     let pairs: Vec<Vec<(u32, u32)>> = par(nt, |_| {
@@ -530,10 +680,11 @@ fn build_links(files: &[B], nt: usize) -> Links {
     })
     .iter()
     .sum();
-    let lcap = (unique * 2).next_power_of_two().max(16);
+    let lcap = ((unique + est_singles) * 2).next_power_of_two().max(16);
     let mut lk = lk;
     lk.lut = zeroed_atomic64(2 * lcap);
     lk.lmask = lcap - 1;
+    lk.single_limit = lcap * 3 / 4 - unique;
     let lk = lk;
     par(nt, |w| {
         for s in w * step..((w + 1) * step).min(cap) {
@@ -557,7 +708,7 @@ fn build_links(files: &[B], nt: usize) -> Links {
             while lk.lut[2 * i].compare_exchange(0, k, Relaxed, Relaxed).is_err() {
                 i = (i + 1) & lk.lmask;
             }
-            lk.lut[2 * i + 1].store(r as u64, Relaxed);
+            lk.lut[2 * i + 1].store(r as u64 | LINK_FLAG, Relaxed);
         }
     });
     lk
@@ -647,20 +798,21 @@ fn main() {
     let ndays = (((we - 1).div_euclid(DAY_MS)) - day0 + 1) as usize;
     let ctx = Ctx { base, ncat, ncamp, ndays, day0 };
 
-    let map_dir = |name: &str| -> Vec<B> { list_csv(&data.join(name)).iter().map(|p| map_file(p)).collect() };
-    let ev_files = map_dir("events");
-    let ck_files = map_dir("clicks");
-    let lk_files = map_dir("links");
-    tick("mapped");
+    let ev_files = open_dir(&data.join("events"));
+    let ck_files = open_dir(&data.join("clicks"));
+    assert!(ck_files.len() < 256, "too many click files");
+    CLICK_FDS.set(ck_files.iter().map(|f| f.fd).collect()).unwrap();
+    let lk_files: Vec<B> = list_csv(&data.join("links")).iter().map(|p| map_file(p)).collect();
+    tick("opened");
 
-    let links = build_links(&lk_files, nt);
+    let ev_bytes: usize = ev_files.iter().map(|f| f.len).sum();
+    let links = build_links(&lk_files, nt, ev_bytes / 85 / 24 + 1024);
     tick("links");
 
     // ---- one parse pass over events + clicks ----
     let mut chunks = Vec::new();
-    make_chunks(&ev_files, 1, &mut chunks);
-    make_chunks(&ck_files, 2, &mut chunks);
-    let ev_bytes: usize = ev_files.iter().map(|d| d.len()).sum();
+    make_rchunks(&ev_files, 1, &mut chunks);
+    make_rchunks(&ck_files, 2, &mut chunks);
     let cur = AtomicUsize::new(0);
     let parsed: Vec<ParseOut> = par(nt, |tid| {
         let mut po = ParseOut {
@@ -673,17 +825,23 @@ fn main() {
             buys: Vec::with_capacity(ev_bytes / 70 / nt / 16 + 1024),
         };
         let tbits = (tid as u32) << 27;
-        // route a resolved event; singletons keep their user id for naming
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + (1 << 20));
+        // route a resolved event; a singleton whose name the table could not take
+        // keeps a copy in snames
         let resolve = |po: &mut ParseOut, uh: u64, uref: u64, mut r: PRec| {
-            r.pkey = links.pkey(uh);
-            if r.pkey >> 63 == 1 {
-                po.snames.push((r.rf & ((1 << 27) - 1), uref));
+            let uid = unpack(uref);
+            let (pk, named) = links.pkey(uh, uid, &mut po.arena);
+            r.pkey = pk;
+            if !named {
+                let p = po.arena.alloc(uid.len());
+                unsafe { std::ptr::copy_nonoverlapping(uid.as_ptr(), p, uid.len()) };
+                po.snames.push((r.rf & ((1 << 27) - 1), p as u64 | ((uid.len() as u64) << 48)));
             }
             po.precs.push(&mut po.arena, p2_of(r.pkey), r);
         };
         // prefetch pipelines: (uid hash, record)
         let mut ep: [(u64, u64, PRec); PIPE] = [(0, 0, PRec { pkey: 0, ts: 0, rf: 0 }); PIPE];
-        let mut cp: [(u64, CRec); PIPE] = [(0, CRec { pkey: 0, idref: 0, ts: 0, camp: 0, _pad: 0 }); PIPE];
+        let mut cp: [(u64, CRec); PIPE] = [(0, CRec { pkey: 0, pfx: 0, loc: 0, ts: 0, camp: 0 }); PIPE];
         let (mut en, mut cn) = (0usize, 0usize);
         loop {
             let i = cur.fetch_add(1, Relaxed);
@@ -691,8 +849,10 @@ fn main() {
                 break;
             }
             let c = chunks[i];
+            let fl = if c.kind == 1 { &ev_files[c.file as usize] } else { &ck_files[c.file as usize] };
+            let (data, off0) = read_lines(fl, c.start, c.end, &mut buf);
             if c.kind == 1 {
-                scan::<7, _>(c.data, c.start, c.end, &mut |f: &[B; 7]| {
+                scan::<7, _>(data, 0, data.len(), &mut |f: &[&[u8]; 7]| {
                     let [eid, uid, ts, ing, typ, pid, price] = *f;
                     if eid.is_empty() {
                         return;
@@ -743,8 +903,14 @@ fn main() {
                     }
                     po.keys.push(&mut po.arena, (h2 >> (64 - P1_BITS)) as usize, KeyRec { h: h1 | 1, ingest, rf });
                 });
+                // pending uids point into buf: resolve them before it is reused
+                for k in en.saturating_sub(PIPE)..en {
+                    let (oh, ur, r) = ep[k % PIPE];
+                    resolve(&mut po, oh, ur, r);
+                }
+                en = 0;
             } else {
-                scan::<4, _>(c.data, c.start, c.end, &mut |f: &[B; 4]| {
+                scan::<4, _>(data, 0, data.len(), &mut |f: &[&[u8]; 4]| {
                     let [id, uid, cid, ts] = *f;
                     if id.is_empty() || uid.is_empty() {
                         return;
@@ -753,27 +919,24 @@ fn main() {
                     if t < base || t >= we {
                         return;
                     }
-                    let Some(&c) = camp.get(&hash1(cid)) else { return };
+                    let Some(&cpn) = camp.get(&hash1(cid)) else { return };
+                    let loc = (c.file as u64) << 56 | ((off0 + (id.as_ptr() as usize - data.as_ptr() as usize)) as u64) << 16 | id.len().min(0xFFFF) as u64;
                     let uh = hash1(uid);
                     links.prefetch(uh);
                     let slot = cn % PIPE;
                     if cn >= PIPE {
                         let (oh, mut r) = cp[slot];
-                        r.pkey = links.pkey(oh);
+                        r.pkey = links.pkey_only(oh);
                         po.crecs.push(&mut po.arena, p2_of(r.pkey), r);
                     }
-                    cp[slot] = (uh, CRec { pkey: 0, idref: pack(id), ts: (t - base) as u32, camp: c, _pad: 0 });
+                    cp[slot] = (uh, CRec { pkey: 0, pfx: prefix8(id), loc, ts: (t - base) as u32, camp: cpn });
                     cn += 1;
                 });
             }
         }
-        for k in en.saturating_sub(PIPE)..en {
-            let (oh, ur, r) = ep[k % PIPE];
-            resolve(&mut po, oh, ur, r);
-        }
         for k in cn.saturating_sub(PIPE)..cn {
             let (oh, mut r) = cp[k % PIPE];
-            r.pkey = links.pkey(oh);
+            r.pkey = links.pkey_only(oh);
             po.crecs.push(&mut po.arena, p2_of(r.pkey), r);
         }
         po.keys.finish(&mut po.arena);
@@ -900,7 +1063,25 @@ struct Ev {
 struct Ck {
     ts: u32,
     camp: u32,
-    idref: u64,
+    pfx: u64,
+    loc: u64,
+}
+
+static CLICK_FDS: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+
+/// click_id of `a` < click_id of `b`, byte-wise; re-reads both ids from their
+/// files only when the 8-byte prefixes tie
+fn click_id_lt(a: &Ck, b: &Ck) -> bool {
+    if a.pfx != b.pfx {
+        return a.pfx < b.pfx;
+    }
+    let read = |loc: u64| -> Vec<u8> {
+        let fd = CLICK_FDS.get().unwrap()[(loc >> 56) as usize];
+        let mut v = vec![0u8; (loc & 0xFFFF) as usize];
+        pread_full(fd, &mut v, ((loc >> 16) & ((1 << 40) - 1)) as usize);
+        v
+    };
+    read(a.loc) < read(b.loc)
 }
 
 /// pkey -> local person id; starts small and doubles at half load.
@@ -1037,8 +1218,13 @@ impl PState {
                 if new {
                     self.pkeys.push(r.pkey);
                     let name = if r.pkey >> 63 == 1 {
-                        let sn = &parsed[t].snames;
-                        sn[sn.partition_point(|x| (x.0 as usize) < s)].1
+                        match links.single_name(r.pkey & !NAME_FLAG) {
+                            0 => {
+                                let sn = &parsed[t].snames;
+                                sn[sn.partition_point(|x| (x.0 as usize) < s)].1
+                            }
+                            n => n,
+                        }
                     } else {
                         links.names[(r.pkey & 0xFFFF_FFFF) as usize].load(Relaxed)
                     };
@@ -1074,7 +1260,7 @@ impl PState {
             po.crecs.for_each(p, |c| {
                 if let Some(pid) = self.tab.get(c.pkey) {
                     self.ccount[pid as usize] += 1;
-                    self.cks.push((pid, Ck { ts: c.ts, camp: c.camp, idref: c.idref }));
+                    self.cks.push((pid, Ck { ts: c.ts, camp: c.camp, pfx: c.pfx, loc: c.loc }));
                 }
             });
         }
@@ -1085,7 +1271,7 @@ impl PState {
             acc += x;
         }
         self.cout.clear();
-        self.cout.resize(self.cks.len(), Ck { ts: 0, camp: 0, idref: 0 });
+        self.cout.resize(self.cks.len(), Ck { ts: 0, camp: 0, pfx: 0, loc: 0 });
         let mut cfill = self.ccount.clone();
         for &(pid, c) in &self.cks {
             self.cout[cfill[pid as usize] as usize] = c;
@@ -1205,7 +1391,7 @@ fn person(ctx: &Ctx, name: u64, evs: &[Ev], cks: &[Ck], wo: &mut WorkerOut, cnt:
                 let mut k = hi - 1;
                 while k > lo && cks[k - 1].ts == t {
                     k -= 1;
-                    if unpack(cks[k].idref) < unpack(cks[best].idref) {
+                    if click_id_lt(&cks[k], &cks[best]) {
                         best = k;
                     }
                 }

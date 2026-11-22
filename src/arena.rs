@@ -33,6 +33,13 @@ impl Arena {
         }
     }
 
+    /// A 64-byte aligned block (streaming stores need the alignment).
+    #[inline(always)]
+    pub fn alloc_block(&mut self, bytes: usize) -> *mut u8 {
+        self.cur = (self.cur + 63) & !63;
+        self.alloc(bytes)
+    }
+
     #[inline(always)]
     pub fn alloc(&mut self, bytes: usize) -> *mut u8 {
         if self.cur + bytes > self.end {
@@ -66,7 +73,7 @@ impl<T: Copy> Parts<T> {
             if !c.0.is_null() {
                 self.full[p].push(c.0);
             }
-            c.0 = arena.alloc(BLK) as *mut T;
+            c.0 = arena.alloc_block(BLK) as *mut T;
             c.1 = 0;
         }
         unsafe { c.0.add(c.1 as usize).write(v) };
@@ -133,7 +140,7 @@ impl<T: Copy> WcParts<T> {
             if !c.0.is_null() {
                 self.full[p].push(c.0);
             }
-            c.0 = arena.alloc(BLK) as *mut T;
+            c.0 = arena.alloc_block(BLK) as *mut T;
             c.1 = 0;
         }
         unsafe { c.0.add(c.1 as usize) }

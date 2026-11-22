@@ -50,7 +50,7 @@ fn masks(data: &[u8], base: usize) -> (u64, u64, u64) {
 /// Calls `f` with the N unquoted fields of every well-formed line that starts in
 /// `[start, end)`. `end` must be a line start (or `data.len()`).
 #[inline(always)]
-pub fn scan<const N: usize, F: FnMut(&[B; N])>(data: B, start: usize, end: usize, f: &mut F) {
+pub fn scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], start: usize, end: usize, f: &mut F) {
     let mut fs = [&data[0..0]; N];
     let mut nf = 0usize;
     let mut bad = false;
