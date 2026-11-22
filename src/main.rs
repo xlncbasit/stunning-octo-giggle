@@ -519,7 +519,7 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 struct KeyRec {
     h: u64,
     ingest: u32, // seconds since epoch (ingest_ts is F1, whole seconds)
-    rf: u32,     // where the ok copy's PRec is (see rec_loc), NONE otherwise
+    rf: u32,     // thread << 28 | seq of the ok copy (ParseOut::locs), NONE otherwise
 }
 
 /// An ok event copy, routed to its person partition.
@@ -532,13 +532,12 @@ struct PRec {
 }
 
 const KILLED: u32 = 1 << 7;
-const LOC_K_BITS: u32 = 18;
+const SEQ_BITS: u32 = 28;
 
-/// thread << 28 | person partition << 18 | index within that thread's partition
+/// a PRec's place: person partition and index within this thread's part of it
 #[inline(always)]
-fn rec_loc(tid: usize, p: usize, k: usize) -> u32 {
-    assert!(k < (1 << LOC_K_BITS) - 1, "partition too large");
-    ((tid as u32) << 28) | ((p as u32) << LOC_K_BITS) | k as u32
+fn rec_pos(p: usize, k: usize) -> u64 {
+    ((p as u64) << 32) | k as u64
 }
 
 #[derive(Clone, Copy)]
@@ -892,7 +891,8 @@ struct ParseOut {
     keys: WcParts<KeyRec>, // [P1]
     precs: WcParts<PRec>,  // [P2]
     crecs: WcParts<CRec>, // [P2]
-    snames: Vec<(u32, u64)>, // names the id table could not take: (rec_loc, packed user id), sorted
+    locs: Vec<u64>,          // seq -> rec_pos of each ok event
+    snames: Vec<(u64, u64)>, // names the id table could not take: (rec_pos, packed user id), sorted
 }
 unsafe impl Send for ParseOut {}
 unsafe impl Sync for ParseOut {}
@@ -992,6 +992,7 @@ fn main() {
             keys: WcParts::new(P1),
             precs: WcParts::new(P2),
             crecs: WcParts::new(P2),
+            locs: Vec::with_capacity(ev_bytes / 70 / nt + 1024),
             snames: Vec::new(),
         };
         // route a resolved ok event and its dedup key (which records where the event
@@ -1001,11 +1002,15 @@ fn main() {
             let (pk, named) = links.pkey(uh, uid, &mut po.arena);
             r.pkey = pk;
             let p = p2_of(pk);
-            key.rf = rec_loc(tid, p, po.precs.next_index(p));
+            let pos = rec_pos(p, po.precs.next_index(p));
+            let seq = po.locs.len();
+            assert!(seq < (1 << SEQ_BITS) - 1, "too many events for one thread");
+            key.rf = ((tid as u32) << SEQ_BITS) | seq as u32;
+            po.locs.push(pos);
             if !named {
                 let c = po.arena.alloc(uid.len());
                 unsafe { std::ptr::copy_nonoverlapping(uid.as_ptr(), c, uid.len()) };
-                po.snames.push((key.rf, c as u64 | ((uid.len() as u64) << 48)));
+                po.snames.push((pos, c as u64 | ((uid.len() as u64) << 48)));
             }
             po.precs.push(&mut po.arena, p, r);
             po.keys.push(&mut po.arena, kp, key);
@@ -1114,10 +1119,9 @@ fn main() {
         let mut table: Vec<KeyRec> = Vec::new();
         let killit = |rf: u32| {
             if rf != NONE {
-                let t = (rf >> 28) as usize;
-                let p = ((rf >> LOC_K_BITS) & ((1 << P2_BITS) - 1)) as usize;
-                let k = (rf & ((1 << LOC_K_BITS) - 1)) as usize;
-                let r = parsed[t].precs.ptr_at(p, k);
+                let t = (rf >> SEQ_BITS) as usize;
+                let pos = parsed[t].locs[(rf & ((1 << SEQ_BITS) - 1)) as usize];
+                let r = parsed[t].precs.ptr_at((pos >> 32) as usize, pos as u32 as usize);
                 unsafe { AtomicU32::from_ptr(std::ptr::addr_of_mut!((*r).pp)).fetch_or(KILLED, Relaxed) };
             }
         };
@@ -1379,8 +1383,8 @@ impl PState {
                         match links.single_name(r.pkey & !NAME_FLAG) {
                             0 => {
                                 let sn = &parsed[t].snames;
-                                let loc = rec_loc(t, p, k);
-                                sn[sn.partition_point(|x| x.0 < loc)].1
+                                let pos = rec_pos(p, k);
+                                sn[sn.partition_point(|x| x.0 < pos)].1
                             }
                             n => n,
                         }
