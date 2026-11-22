@@ -2,7 +2,7 @@
 //! fixed-size blocks carved from it: no Vec doubling, no copies, few page faults.
 
 const REGION: usize = 256 << 20;
-const BLK: usize = 8192;
+const BLK: usize = 4096;
 
 pub struct Arena {
     cur: usize,
@@ -98,7 +98,7 @@ impl<T: Copy> Parts<T> {
 #[derive(Clone, Copy)]
 struct Line([u8; 64]);
 
-/// Partitioned buffers for 16-byte records with software write-combining: each
+/// Partitioned buffers for 16- or 32-byte records with software write-combining: each
 /// partition stages one cache line, and full lines go out with non-temporal
 /// stores, so scattering to many partitions costs little more than one stream.
 pub struct WcParts<T> {
@@ -112,10 +112,12 @@ unsafe impl<T: Send> Send for WcParts<T> {}
 unsafe impl<T: Sync> Sync for WcParts<T> {}
 
 impl<T: Copy> WcParts<T> {
-    const PER: usize = BLK / 16;
+    const SZ: usize = std::mem::size_of::<T>();
+    const PER: usize = BLK / Self::SZ;
+    const LINE: usize = 64 / Self::SZ; // records per cache line
 
     pub fn new(np: usize) -> Self {
-        assert!(std::mem::size_of::<T>() == 16);
+        assert!(Self::SZ == 16 || Self::SZ == 32);
         WcParts {
             stage: vec![Line([0; 64]); np],
             fill: vec![0; np],
@@ -142,10 +144,10 @@ impl<T: Copy> WcParts<T> {
         let f = unsafe { *self.fill.get_unchecked(p) } as usize;
         let line = unsafe { self.stage.get_unchecked_mut(p) };
         unsafe { (line.0.as_mut_ptr() as *mut T).add(f).write(v) };
-        if f == 3 {
+        if f == Self::LINE - 1 {
             let dst = self.room(arena, p);
             unsafe { stream64(dst as *mut u8, self.stage.get_unchecked(p).0.as_ptr()) };
-            self.cur[p].1 += 4;
+            self.cur[p].1 += Self::LINE as u32;
             self.fill[p] = 0;
         } else {
             self.fill[p] = (f + 1) as u8;

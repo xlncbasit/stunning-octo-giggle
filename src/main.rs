@@ -13,7 +13,7 @@ mod arena;
 mod parquet_out;
 mod scan;
 
-use arena::{Arena, Parts, WcParts};
+use arena::{Arena, WcParts};
 
 use scan::{scan, B};
 
@@ -312,6 +312,7 @@ struct CRec {
     idref: u64,
     ts: u32,
     camp: u32,
+    _pad: u64,
 }
 
 #[inline(always)]
@@ -589,8 +590,9 @@ struct ParseOut {
     arena: Arena,
     keys: WcParts<KeyRec>, // [P1]
     precs: WcParts<PRec>,  // [P2]
-    crecs: Parts<CRec>,  // [P2]
-    urefs: Vec<u64>,     // seq -> packed user id
+    crecs: WcParts<CRec>, // [P2]
+    nseq: u32,               // ok events so far (seq numbers)
+    snames: Vec<(u32, u64)>, // singleton persons' events: (seq, packed user id), seq ascending
     buys: Vec<(u32, u32)>, // purchases only: (seq, price << 8 | cat << 1 | 1), seq ascending
 }
 unsafe impl Send for ParseOut {}
@@ -665,14 +667,23 @@ fn main() {
             arena: Arena::new(),
             keys: WcParts::new(P1),
             precs: WcParts::new(P2),
-            crecs: Parts::new(P2),
-            urefs: Vec::with_capacity(ev_bytes / 70 / nt + 1024),
+            crecs: WcParts::new(P2),
+            nseq: 0,
+            snames: Vec::with_capacity(ev_bytes / 70 / nt / 2 + 1024),
             buys: Vec::with_capacity(ev_bytes / 70 / nt / 16 + 1024),
         };
         let tbits = (tid as u32) << 27;
+        // route a resolved event; singletons keep their user id for naming
+        let resolve = |po: &mut ParseOut, uh: u64, uref: u64, mut r: PRec| {
+            r.pkey = links.pkey(uh);
+            if r.pkey >> 63 == 1 {
+                po.snames.push((r.rf & ((1 << 27) - 1), uref));
+            }
+            po.precs.push(&mut po.arena, p2_of(r.pkey), r);
+        };
         // prefetch pipelines: (uid hash, record)
-        let mut ep: [(u64, PRec); PIPE] = [(0, PRec { pkey: 0, ts: 0, rf: 0 }); PIPE];
-        let mut cp: [(u64, CRec); PIPE] = [(0, CRec { pkey: 0, idref: 0, ts: 0, camp: 0 }); PIPE];
+        let mut ep: [(u64, u64, PRec); PIPE] = [(0, 0, PRec { pkey: 0, ts: 0, rf: 0 }); PIPE];
+        let mut cp: [(u64, CRec); PIPE] = [(0, CRec { pkey: 0, idref: 0, ts: 0, camp: 0, _pad: 0 }); PIPE];
         let (mut en, mut cn) = (0usize, 0usize);
         loop {
             let i = cur.fetch_add(1, Relaxed);
@@ -714,9 +725,9 @@ fn main() {
                             let cat = *prod.get(&hash1(pid)).unwrap_or(&unknown_rank);
                             pp = (p << 8) | (cat << 1) | 1;
                         }
-                        let seq = po.urefs.len() as u32;
+                        let seq = po.nseq;
+                        po.nseq += 1;
                         rf = tbits | seq;
-                        po.urefs.push(pack(uid));
                         if pp != 0 {
                             po.buys.push((seq, pp));
                         }
@@ -724,11 +735,10 @@ fn main() {
                         links.prefetch(uh);
                         let slot = en % PIPE;
                         if en >= PIPE {
-                            let (oh, mut r) = ep[slot];
-                            r.pkey = links.pkey(oh);
-                            po.precs.push(&mut po.arena, p2_of(r.pkey), r);
+                            let (oh, ur, r) = ep[slot];
+                            resolve(&mut po, oh, ur, r);
                         }
-                        ep[slot] = (uh, PRec { pkey: 0, ts: (t - base) as u32, rf: rf | ((pp & 1) << 31) });
+                        ep[slot] = (uh, pack(uid), PRec { pkey: 0, ts: (t - base) as u32, rf: rf | ((pp & 1) << 31) });
                         en += 1;
                     }
                     po.keys.push(&mut po.arena, (h2 >> (64 - P1_BITS)) as usize, KeyRec { h: h1 | 1, ingest, rf });
@@ -752,15 +762,14 @@ fn main() {
                         r.pkey = links.pkey(oh);
                         po.crecs.push(&mut po.arena, p2_of(r.pkey), r);
                     }
-                    cp[slot] = (uh, CRec { pkey: 0, idref: pack(id), ts: (t - base) as u32, camp: c });
+                    cp[slot] = (uh, CRec { pkey: 0, idref: pack(id), ts: (t - base) as u32, camp: c, _pad: 0 });
                     cn += 1;
                 });
             }
         }
         for k in en.saturating_sub(PIPE)..en {
-            let (oh, mut r) = ep[k % PIPE];
-            r.pkey = links.pkey(oh);
-            po.precs.push(&mut po.arena, p2_of(r.pkey), r);
+            let (oh, ur, r) = ep[k % PIPE];
+            resolve(&mut po, oh, ur, r);
         }
         for k in cn.saturating_sub(PIPE)..cn {
             let (oh, mut r) = cp[k % PIPE];
@@ -768,13 +777,14 @@ fn main() {
             po.crecs.push(&mut po.arena, p2_of(r.pkey), r);
         }
         po.keys.finish(&mut po.arena);
+        po.crecs.finish(&mut po.arena);
         po.precs.finish(&mut po.arena);
         po
     });
     tick("parsed");
 
     // ---- dedup: mark every non-winning ok copy in a kill bitmap ----
-    let kill: Vec<&[AtomicU64]> = parsed.iter().map(|p| zeroed_atomic64(p.urefs.len() / 64 + 1)).collect();
+    let kill: Vec<&[AtomicU64]> = parsed.iter().map(|p| zeroed_atomic64(p.nseq as usize / 64 + 1)).collect();
     let cur = AtomicUsize::new(0);
     par(nt, |_| {
         let mut table: Vec<KeyRec> = Vec::new();
@@ -1027,7 +1037,8 @@ impl PState {
                 if new {
                     self.pkeys.push(r.pkey);
                     let name = if r.pkey >> 63 == 1 {
-                        parsed[t].urefs[s]
+                        let sn = &parsed[t].snames;
+                        sn[sn.partition_point(|x| (x.0 as usize) < s)].1
                     } else {
                         links.names[(r.pkey & 0xFFFF_FFFF) as usize].load(Relaxed)
                     };
