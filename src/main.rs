@@ -891,9 +891,78 @@ struct Ck {
     idref: u64,
 }
 
+/// pkey -> local person id; starts small and doubles at half load.
+struct PTab {
+    e: Vec<(u64, u32)>,
+    mask: usize,
+    n: usize,
+}
+
+impl PTab {
+    #[inline(always)]
+    fn idx(pkey: u64, mask: usize) -> usize {
+        (pkey.wrapping_mul(0x9E3779B97F4A7C15) >> 20) as usize & mask
+    }
+    fn reset(&mut self, cap: usize) {
+        self.e.clear();
+        self.e.resize(cap, (0, 0));
+        self.mask = cap - 1;
+        self.n = 0;
+    }
+    #[inline(always)]
+    fn get(&self, pkey: u64) -> Option<u32> {
+        let mut i = Self::idx(pkey, self.mask);
+        loop {
+            let (k, v) = self.e[i];
+            if k == pkey {
+                return Some(v);
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    /// Returns (pid, inserted)
+    #[inline(always)]
+    fn get_or_insert(&mut self, pkey: u64, next: u32) -> (u32, bool) {
+        let mut i = Self::idx(pkey, self.mask);
+        loop {
+            let (k, v) = self.e[i];
+            if k == pkey {
+                return (v, false);
+            }
+            if k == 0 {
+                self.e[i] = (pkey, next);
+                self.n += 1;
+                if self.n * 2 > self.e.len() {
+                    self.grow();
+                }
+                return (next, true);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[cold]
+    fn grow(&mut self) {
+        let old = std::mem::take(&mut self.e);
+        let cap = old.len() * 2;
+        self.e.resize(cap, (0, 0));
+        self.mask = cap - 1;
+        for (k, v) in old {
+            if k != 0 {
+                let mut i = Self::idx(k, self.mask);
+                while self.e[i].0 != 0 {
+                    i = (i + 1) & self.mask;
+                }
+                self.e[i] = (k, v);
+            }
+        }
+    }
+}
+
 struct PState {
-    tkeys: Vec<u64>,
-    tpid: Vec<u32>,
+    tab: PTab,
     pkeys: Vec<u64>,
     pname: Vec<u64>,
     ecount: Vec<u32>,
@@ -911,8 +980,7 @@ struct PState {
 impl PState {
     fn new(ncamp: usize) -> Self {
         PState {
-            tkeys: Vec::new(),
-            tpid: Vec::new(),
+            tab: PTab { e: Vec::new(), mask: 0, n: 0 },
             pkeys: Vec::new(),
             pname: Vec::new(),
             ecount: Vec::new(),
@@ -933,11 +1001,7 @@ impl PState {
         if n == 0 {
             return;
         }
-        let cap = (n * 2).next_power_of_two().max(16);
-        let mask = cap - 1;
-        self.tkeys.clear();
-        self.tkeys.resize(cap, 0);
-        self.tpid.resize(cap, 0);
+        self.tab.reset((n / 8).next_power_of_two().max(256));
         self.pkeys.clear();
         self.pname.clear();
         self.ecount.clear();
@@ -952,28 +1016,17 @@ impl PState {
                     return;
                 }
                 let pp = if r.rf >> 31 == 1 { parsed[t].pps[s] } else { 0 };
-                let mut i = (r.pkey.wrapping_mul(0x9E3779B97F4A7C15) >> 20) as usize & mask;
-                let pid = loop {
-                    let k = self.tkeys[i];
-                    if k == r.pkey {
-                        break self.tpid[i];
-                    }
-                    if k == 0 {
-                        self.tkeys[i] = r.pkey;
-                        let pid = self.pkeys.len() as u32;
-                        self.tpid[i] = pid;
-                        self.pkeys.push(r.pkey);
-                        let name = if r.pkey >> 63 == 1 {
-                            parsed[t].urefs[s]
-                        } else {
-                            links.names[(r.pkey & 0xFFFF_FFFF) as usize].load(Relaxed)
-                        };
-                        self.pname.push(name);
-                        self.ecount.push(0);
-                        break pid;
-                    }
-                    i = (i + 1) & mask;
-                };
+                let (pid, new) = self.tab.get_or_insert(r.pkey, self.pkeys.len() as u32);
+                if new {
+                    self.pkeys.push(r.pkey);
+                    let name = if r.pkey >> 63 == 1 {
+                        parsed[t].urefs[s]
+                    } else {
+                        links.names[(r.pkey & 0xFFFF_FFFF) as usize].load(Relaxed)
+                    };
+                    self.pname.push(name);
+                    self.ecount.push(0);
+                }
                 self.ecount[pid as usize] += 1;
                 self.epid.push(pid);
                 self.evs.push(Ev { ts: r.ts, pp });
@@ -1001,19 +1054,9 @@ impl PState {
         self.ccount.resize(np, 0);
         for po in parsed {
             po.crecs.for_each(p, |c| {
-                let mut i = (c.pkey.wrapping_mul(0x9E3779B97F4A7C15) >> 20) as usize & mask;
-                loop {
-                    let k = self.tkeys[i];
-                    if k == c.pkey {
-                        let pid = self.tpid[i];
-                        self.ccount[pid as usize] += 1;
-                        self.cks.push((pid, Ck { ts: c.ts, camp: c.camp, idref: c.idref }));
-                        break;
-                    }
-                    if k == 0 {
-                        break;
-                    }
-                    i = (i + 1) & mask;
+                if let Some(pid) = self.tab.get(c.pkey) {
+                    self.ccount[pid as usize] += 1;
+                    self.cks.push((pid, Ck { ts: c.ts, camp: c.camp, idref: c.idref }));
                 }
             });
         }
