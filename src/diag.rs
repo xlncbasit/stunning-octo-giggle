@@ -174,8 +174,8 @@ fn calib() -> f64 {
     t.elapsed().as_secs_f64()
 }
 
-/// Runs this binary on `data` in a child process; returns (wall s, phase line).
-fn child_phases(data: &Path) -> (f64, String) {
+/// Runs this binary on `data` in a child process with NCPU=`nt`; returns (wall s, phase line).
+fn child_phases(data: &Path, nt: usize) -> (f64, String) {
     let base = std::env::var("SCRATCH_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
     let out = base.join(format!("diag_out_{}", std::process::id()));
     let _ = fs::remove_dir_all(&out);
@@ -183,6 +183,7 @@ fn child_phases(data: &Path) -> (f64, String) {
     let o = std::process::Command::new("/proc/self/exe")
         .env("SS_NODIAG", "1")
         .env("SS_VERBOSE", "1")
+        .env("NCPU", nt.to_string())
         .env("DATA_DIR", data)
         .env("OUTPUT_DIR", &out)
         .output();
@@ -194,7 +195,8 @@ fn child_phases(data: &Path) -> (f64, String) {
             .filter(|l| l.starts_with('['))
             .map(|l| {
                 let v: Vec<&str> = l.trim_start_matches('[').split(']').collect();
-                format!("{}={}", v.get(1).unwrap_or(&"").trim(), v[0].trim().trim_end_matches('s'))
+                let name = v.get(1).unwrap_or(&"").trim();
+                format!("{}={}", &name[..name.len().min(4)], v[0].trim().trim_end_matches('s'))
             })
             .collect::<Vec<_>>()
             .join(" "),
@@ -204,29 +206,45 @@ fn child_phases(data: &Path) -> (f64, String) {
     (s, ph)
 }
 
-pub fn run(data: &Path, _nt: usize) {
+fn peak_rss_children() -> i64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) };
+    ru.ru_maxrss / 1024
+}
+
+fn generate(gen: &Path, out: &Path, events: &str, clicks: &str) {
+    let t = Instant::now();
+    let st = std::process::Command::new(gen)
+        .args(["--seed", "2", "--events", events, "--clicks", clicks, "--output"])
+        .arg(out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    eprintln!("V gen {} {:?} {:.1}s", events, st.map(|s| s.success()), t.elapsed().as_secs_f64());
+}
+
+pub fn run(_data: &Path, _nt: usize) {
     let t0 = Instant::now();
-    let (w, ph) = child_phases(data);
-    eprintln!("V dev: wall {:.3}s | {}", w, ph);
     let genp = std::env::var("SS_GEN").unwrap_or_else(|_| "/app/generate".into());
     let gen = Path::new(&genp);
     let scratch = std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into());
-    let g20 = Path::new(&scratch).join("g20");
-    if gen.exists() {
-        let t = Instant::now();
-        let st = std::process::Command::new(gen)
-            .args(["--seed", "2", "--events", "20000000", "--clicks", "5000000", "--output"])
-            .arg(&g20)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        eprintln!("V gen20 {:?} in {:.1}s", st.map(|s| s.success()), t.elapsed().as_secs_f64());
-        for i in 0..3 {
-            let (w, ph) = child_phases(&g20);
-            eprintln!("V r{} 20M: wall {:.3}s | {}", i, w, ph);
-        }
-    } else {
+    if !gen.exists() {
         eprintln!("V no generator in image");
+        return;
     }
-    eprintln!("V diag total {:.1}s", t0.elapsed().as_secs_f64());
+    let g20 = Path::new(&scratch).join("g20");
+    generate(gen, &g20, "20000000", "5000000");
+    for nt in [8, 16, 8] {
+        let (w, ph) = child_phases(&g20, nt);
+        eprintln!("V 20M nt{} {:.3}s | {}", nt, w, ph);
+    }
+    let _ = fs::remove_dir_all(&g20);
+    let g60 = Path::new(&scratch).join("g60");
+    generate(gen, &g60, "60000000", "15000000");
+    for nt in [8, 16, 8] {
+        let (w, ph) = child_phases(&g60, nt);
+        eprintln!("V 60M nt{} {:.3}s | {}", nt, w, ph);
+    }
+    eprintln!("V peak child rss {} MB, total {:.1}s", peak_rss_children(), t0.elapsed().as_secs_f64());
+    let _ = fs::remove_dir_all(&g60);
 }
